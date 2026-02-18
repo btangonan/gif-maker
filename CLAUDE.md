@@ -4,43 +4,113 @@
 
 ---
 
-## 🚀 What This App Is & How to Run It
+## What This App Is
 
-A single-file drag-and-drop web app that converts MP4 (and other video) to GIF.
-No pip installs needed — uses Python stdlib + `ffmpeg`/`ffprobe` (installed via Homebrew).
+Single-file drag-and-drop web app that converts video (MP4, MOV, WEBM) to GIF.
+All logic lives in `app.py` — Python HTTP server with embedded HTML/CSS/JS frontend.
 
-### Run it
+## How to Run
+
 ```bash
 python3 "/Users/bradleytangonan/Desktop/my apps/gif-maker/app.py"
 ```
 - Auto-opens browser at **http://localhost:7878**
 - Stop with `Ctrl+C`
-- If port is busy: `kill $(lsof -ti :7878)`
+- Port conflict: `kill $(lsof -ti :7878)`
 
-### File structure
+## File Structure
+
 ```
 gif-maker/
-├── app.py        ← entire app (server + HTML/CSS/JS all in one file)
-├── output/       ← generated GIFs land here (auto-created)
-└── CLAUDE.md     ← this file
+├── app.py        — entire app (server + frontend in one file)
+├── output/       — generated GIFs saved here (auto-created on first run)
+├── CLAUDE.md     — this file
+└── claudedocs/   — session notes and analysis
 ```
 
-### Architecture in one paragraph
-`app.py` is a Python `http.server` with an embedded HTML/JS frontend. The frontend POSTs the video as `multipart/form-data`. The server parses it, saves a temp file, and runs `ffmpeg` in a background thread (2-pass palette for high quality). The frontend polls `/status/<job_id>` every 800ms and shows the result GIF with a download button when done.
+## Stack
 
-### System requirements
+| Layer | Technology |
+|-------|-----------|
+| Server | Python `http.server` + `socketserver` (stdlib only, no Flask) |
+| Frontend | Vanilla HTML/CSS/JS embedded as a string in `app.py` |
+| Upload | Custom multipart/form-data parser (stdlib, no dependencies) |
+| Job queue | In-memory `dict` + `threading.Thread` per job |
+| GIF encoding | ffmpeg, Gifski, or libvips — user-selectable |
+| Frame extraction | ffmpeg (all encoder paths) |
+| Python bindings | `pyvips` (required for libvips encoder) |
+
+## System Requirements
+
 - Python 3.8+
-- `ffmpeg` + `ffprobe` → verify: `which ffmpeg`
+- `ffmpeg` + `ffprobe` — `which ffmpeg`
+- `gifski` — `which gifski`
+- `vips` + `pyvips` — `which vips` / `python3 -c "import pyvips"`
 - macOS (tested Darwin 24.x, Apple Silicon)
+- All tools installed via Homebrew; pyvips via `pip3 install --break-system-packages pyvips`
 
-### UI options
-| Option | Values |
-|--------|--------|
-| FPS | 5–30 slider |
+## Architecture
+
+```
+Browser
+  │ drag & drop video file
+  │ POST /convert  (multipart/form-data)
+  ▼
+Handler.do_POST
+  │ parse_multipart() — custom stdlib parser
+  │ write video to tempfile
+  │ spawn threading.Thread → run_conversion()
+  │ return { job_id }
+  ▼
+run_conversion(job_id, params)
+  │ jobs[job_id] = { status, step }   ← polled by frontend
+  │
+  ├── encoder == "gifski"
+  │     gifski --fps --width -o output.gif input.mp4
+  │     (trim via ffmpeg pre-pass if start/end set)
+  │
+  ├── encoder == "libvips"
+  │     ffmpeg → PNG frames → pyvips.arrayjoin()
+  │     set page-height + delay metadata → gifsave()
+  │
+  ├── encoder == "ffmpeg-high"
+  │     ffmpeg palettegen (pass 1) → paletteuse (pass 2)
+  │
+  └── encoder == "ffmpeg-med"
+        ffmpeg single pass
+  │
+  └── ffprobe → gather width/height/frame count
+      jobs[job_id] = { status: "done", url, size, ... }
+
+Browser polls GET /status/<job_id> every 800ms
+  → on "done": display preview img + Download button
+```
+
+## Encoders
+
+| Encoder | Key | Mechanism |
+|---------|-----|-----------|
+| Gifski | `gifski` | Perceptual quantization via gifski binary |
+| ffmpeg 2-pass | `ffmpeg-high` | palettegen + paletteuse with Bayer dithering |
+| libvips | `libvips` | pyvips arrayjoin + cgif-backed gifsave |
+| ffmpeg | `ffmpeg-med` | Single-pass ffmpeg |
+
+## UI Controls
+
+| Control | Values |
+|---------|--------|
+| FPS | 5–30 (slider) |
 | Width | Original / 800 / 640 / 480 / 320px |
-| Start / End | Seconds (trim clip) |
-| Quality | High (2-pass palette) / Medium (fast) |
-| Loop | Forever / Once / Twice |
+| Start / End | Seconds — trims the clip |
+| Encoder | Gifski / ffmpeg (2-pass palette) / libvips / ffmpeg |
+| Loop | Forever / Play once / Twice |
+
+## Known Limitations
+
+- Job state is in-memory — restarting the server clears all jobs
+- Large uploads (>500MB) are held entirely in memory during parsing
+- No job cancellation — a running ffmpeg/gifski process continues until done even if browser closes
+- Output GIFs persist in `output/` indefinitely; no auto-cleanup
 
 ---
 
