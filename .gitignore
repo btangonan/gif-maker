@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Generated output
+output/
+
+# macOS
+.DS_Store
+
+# Temp uploads
+uploads/
+tmp/
+
+# ChromaDB local data
+.chroma/
