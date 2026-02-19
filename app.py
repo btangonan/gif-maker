@@ -10,18 +10,23 @@ import socketserver
 import json
 import os
 import subprocess
+import sys
+import time
 import threading
 import uuid
 import urllib.parse
 from pathlib import Path
 
-PORT = 7878
+PORT = int(os.environ.get("PORT", 7878))
+MAX_UPLOAD_BYTES = 150 * 1024 * 1024  # 150 MB
+MAX_JOBS = 500
 BASE_DIR = Path(__file__).parent
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 # Track job progress
 jobs = {}
+jobs_lock = threading.Lock()
 
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -382,7 +387,6 @@ HTML = """<!DOCTYPE html>
     <div class="option-group">
       <label>Encoder</label>
       <select id="encoder">
-        <option value="gifski">Gifski</option>
         <option value="ffmpeg-high" selected>ffmpeg (2-pass palette)</option>
         <option value="libvips">libvips</option>
         <option value="ffmpeg-med">ffmpeg</option>
@@ -531,7 +535,7 @@ function showResult(data) {
   progressSection.classList.remove('visible');
   resultSection.classList.add('visible');
   resultGif.src = data.url + '?t=' + Date.now();
-  const encoderLabel = {gifski:'Gifski','ffmpeg-high':'ffmpeg (2-pass)','libvips':'libvips','ffmpeg-med':'ffmpeg'}[data.encoder] || data.encoder;
+  const encoderLabel = {'ffmpeg-high':'ffmpeg (2-pass)','libvips':'libvips','ffmpeg-med':'ffmpeg'}[data.encoder] || data.encoder;
   resultMeta.textContent = `${data.width}×${data.height} · ${data.size} · ${data.frames} frames · ${data.fps} fps · ${encoderLabel}`;
   downloadBtn.href = data.url;
   downloadBtn.download = data.filename;
@@ -592,7 +596,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             fpath = OUTPUT_DIR / fname
             if fpath.exists() and fpath.suffix == ".gif":
                 data = fpath.read_bytes()
-                self._send(200, "image/gif", data)
+                self.send_response(200)
+                self.send_header("Content-Type", "image/gif")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                self.end_headers()
+                self.wfile.write(data)
             else:
                 self._send(404, "text/plain", b"Not found")
         else:
@@ -600,12 +609,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/convert":
-            content_type = self.headers.get("Content-Type", "")
             content_length = int(self.headers.get("Content-Length", 0))
+            if content_length > MAX_UPLOAD_BYTES:
+                self._json(413, {"error": f"File too large. Max upload is 150 MB."})
+                return
+            content_type = self.headers.get("Content-Type", "")
             body = self.rfile.read(content_length)
 
             job_id = str(uuid.uuid4())[:8]
-            jobs[job_id] = {"status": "queued", "step": "Queued…"}
+            with jobs_lock:
+                if len(jobs) >= MAX_JOBS:
+                    oldest = list(jobs.keys())[:50]
+                    for k in oldest:
+                        jobs.pop(k, None)
+                jobs[job_id] = {"status": "queued", "step": "Queued…"}
 
             # Parse multipart
             try:
@@ -737,50 +754,8 @@ def run_conversion(job_id: str, params: dict):
             else:
                 time_args += ["-to", end]
 
-        # ── Gifski ────────────────────────────────────────────────────────────
-        if encoder == "gifski":
-            update("Encoding with Gifski…")
-            # gifski loop mapping: UI 0=forever→0, 1=once→-1, 2=twice→1
-            gifski_repeat = {0: 0, 1: -1, 2: 1}.get(loop, 0)
-            gifski_cmd = [
-                "gifski",
-                "--fps", str(fps),
-                "--quality", "90",
-                "--repeat", str(gifski_repeat),
-                "-o", output_path,
-            ]
-            if width_opt != "original":
-                gifski_cmd += ["-W", width_opt]
-            # gifski handles trim via ffmpeg pre-pass if time args needed
-            if time_args:
-                # extract trimmed clip first, then feed to gifski
-                update("Trimming clip…")
-                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
-                    trimmed_path = tf.name
-                trim_cmd = [
-                    "ffmpeg", "-y", *time_args,
-                    "-i", input_path,
-                    "-c", "copy", trimmed_path
-                ]
-                r = subprocess.run(trim_cmd, capture_output=True, text=True, timeout=120)
-                if r.returncode != 0:
-                    # fallback: re-encode trim
-                    trim_cmd = ["ffmpeg", "-y", *time_args, "-i", input_path, trimmed_path]
-                    r = subprocess.run(trim_cmd, capture_output=True, text=True, timeout=120)
-                if r.returncode != 0:
-                    raise RuntimeError(f"Trim failed:\n{r.stderr[-800:]}")
-                gifski_cmd.append(trimmed_path)
-                update("Encoding with Gifski…")
-                result = subprocess.run(gifski_cmd, capture_output=True, text=True, timeout=300)
-                os.unlink(trimmed_path)
-            else:
-                gifski_cmd.append(input_path)
-                result = subprocess.run(gifski_cmd, capture_output=True, text=True, timeout=300)
-            if result.returncode != 0:
-                raise RuntimeError(f"Gifski failed:\n{result.stderr[-800:]}")
-
         # ── libvips ───────────────────────────────────────────────────────────
-        elif encoder == "libvips":
+        if encoder == "libvips":
             import glob as globmod
             frames_dir = tempfile.mkdtemp()
             update("Extracting frames…")
@@ -891,18 +866,43 @@ def run_conversion(job_id: str, params: dict):
             except OSError: pass
 
 
-class ReusableTCPServer(socketserver.TCPServer):
-    """TCPServer with SO_REUSEADDR set before socket.bind() is called."""
+class GifMakerServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    """Thread-per-request server so status polling doesn't block uploads."""
     allow_reuse_address = True
+    daemon_threads = True
+
+
+def _cleanup_loop():
+    """Background thread: delete GIFs and job entries older than 1 hour."""
+    while True:
+        time.sleep(1800)  # run every 30 minutes
+        cutoff = time.time() - 3600
+        for fpath in list(OUTPUT_DIR.iterdir()):
+            if fpath.suffix == ".gif":
+                try:
+                    if fpath.stat().st_mtime < cutoff:
+                        fpath.unlink()
+                except OSError:
+                    pass
+        with jobs_lock:
+            stale = [k for k, v in list(jobs.items())
+                     if isinstance(v, dict) and v.get("status") in ("done", "error")]
+            for k in stale[:-100]:  # keep last 100 completed
+                jobs.pop(k, None)
 
 
 def main():
-    import webbrowser
-    print(f"\n  GIF Maker running at http://localhost:{PORT}")
-    print(f"  Press Ctrl+C to stop\n")
-    threading.Timer(0.8, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+    threading.Thread(target=_cleanup_loop, daemon=True).start()
+
+    print(f"\n  GIF Maker running at http://0.0.0.0:{PORT}")
+    is_local = sys.stdout.isatty()
+    if is_local:
+        import webbrowser
+        print(f"  Press Ctrl+C to stop\n")
+        threading.Timer(0.8, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
+
     try:
-        with ReusableTCPServer(("", PORT), Handler) as httpd:
+        with GifMakerServer(("", PORT), Handler) as httpd:
             try:
                 httpd.serve_forever()
             except KeyboardInterrupt:
