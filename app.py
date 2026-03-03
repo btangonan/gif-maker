@@ -401,7 +401,7 @@ HTML = """<!DOCTYPE html>
 <body>
 <div class="app">
   <h1>GIF Maker</h1>
-  <p class="subtitle">Drop an MP4 to turn it into a GIF</p>
+  <p class="subtitle">Drop an MP4 to make a GIF</p>
 
   <!-- Drop Zone -->
   <div class="drop-zone" id="dropZone">
