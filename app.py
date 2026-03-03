@@ -34,18 +34,39 @@ HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>GIF Maker</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
 <style>
+  :root {
+    --bg-primary: #0a0a0a;
+    --bg-secondary: #141414;
+    --bg-tertiary: #1a1a1a;
+    --accent-primary: #c8ff00;
+    --accent-secondary: #ff6b6b;
+    --accent-success: #4ade80;
+    --text-primary: #e4e4e7;
+    --text-secondary: #a1a1aa;
+    --text-muted: #71717a;
+    --border-color: #2a2a2a;
+    --cell-hover: rgba(200, 255, 0, 0.15);
+    --shadow: 0 4px 20px rgba(0, 0, 0, 0.6);
+    --radius: 8px;
+    --transition: 0.2s ease;
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
   body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-    background: #0f0f13;
-    color: #e8e8f0;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
     min-height: 100vh;
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 24px;
+    overflow-x: hidden;
   }
 
   .app {
@@ -54,38 +75,48 @@ HTML = """<!DOCTYPE html>
   }
 
   h1 {
-    font-size: 1.5rem;
-    font-weight: 700;
+    font-family: 'Inter', sans-serif;
+    font-size: 2rem;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    color: var(--accent-primary);
     margin-bottom: 6px;
-    letter-spacing: -0.02em;
   }
 
   .subtitle {
-    color: #888;
-    font-size: 0.85rem;
+    color: var(--text-secondary);
+    font-size: 0.95rem;
+    font-weight: 400;
     margin-bottom: 28px;
   }
 
   /* Drop zone */
   .drop-zone {
-    border: 2px dashed #333;
-    border-radius: 14px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border: 2px dashed var(--border-color);
+    border-radius: var(--radius);
     padding: 48px 24px;
     text-align: center;
     cursor: pointer;
-    transition: all 0.2s;
-    background: #16161e;
+    transition: all var(--transition);
+    background: var(--bg-secondary);
     position: relative;
   }
 
   .drop-zone:hover, .drop-zone.drag-over {
-    border-color: #7c5cfc;
-    background: #1a1828;
+    border-color: var(--accent-primary);
+    background: var(--cell-hover);
   }
 
   .drop-zone.has-file {
-    border-color: #5c9cfc;
-    background: #131a28;
+    border-color: var(--accent-primary);
+    border-style: solid;
+    background: var(--cell-hover);
   }
 
   .drop-icon {
@@ -95,12 +126,17 @@ HTML = """<!DOCTYPE html>
   .drop-label {
     font-size: 1rem;
     font-weight: 500;
-    margin-bottom: 6px;
+    color: var(--text-secondary);
+  }
+
+  .drop-zone:hover .drop-label,
+  .drop-zone.drag-over .drop-label {
+    color: var(--accent-primary);
   }
 
   .drop-hint {
     font-size: 0.8rem;
-    color: #666;
+    color: var(--text-muted);
   }
 
   .file-info {
@@ -114,10 +150,10 @@ HTML = """<!DOCTYPE html>
 
   .file-name {
     font-weight: 600;
-    color: #7cb4fc;
+    color: var(--accent-primary);
   }
 
-  .file-size { color: #666; font-size: 0.8rem; }
+  .file-size { color: var(--text-muted); font-size: 0.8rem; }
 
   input[type="file"] {
     position: absolute;
@@ -128,8 +164,9 @@ HTML = """<!DOCTYPE html>
 
   /* Options */
   .options {
-    background: #16161e;
-    border-radius: 14px;
+    background: var(--bg-secondary);
+    border-radius: var(--radius);
+    border: 1px solid var(--border-color);
     padding: 20px;
     margin-top: 16px;
     display: grid;
@@ -146,27 +183,29 @@ HTML = """<!DOCTYPE html>
   .option-group.full { grid-column: 1 / -1; }
 
   label {
-    font-size: 0.78rem;
+    font-size: 0.8rem;
     font-weight: 600;
-    color: #999;
+    color: var(--text-muted);
     text-transform: uppercase;
     letter-spacing: 0.04em;
   }
 
   select, input[type="number"] {
-    background: #0f0f13;
-    border: 1px solid #2a2a35;
-    color: #e8e8f0;
-    border-radius: 8px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    color: var(--text-primary);
+    border-radius: 6px;
     padding: 8px 10px;
     font-size: 0.9rem;
+    font-family: 'Inter', sans-serif;
+    font-weight: 500;
     width: 100%;
     outline: none;
-    transition: border-color 0.15s;
+    transition: border-color var(--transition);
   }
 
   select:focus, input[type="number"]:focus {
-    border-color: #7c5cfc;
+    border-color: var(--accent-primary);
   }
 
   .time-row {
@@ -188,7 +227,7 @@ HTML = """<!DOCTYPE html>
     flex: 1;
     -webkit-appearance: none;
     height: 4px;
-    background: #2a2a35;
+    background: var(--border-color);
     border-radius: 2px;
     border: none;
     padding: 0;
@@ -200,14 +239,14 @@ HTML = """<!DOCTYPE html>
     width: 16px;
     height: 16px;
     border-radius: 50%;
-    background: #7c5cfc;
+    background: var(--accent-primary);
     cursor: pointer;
   }
 
   .slider-val {
     font-size: 0.85rem;
     font-weight: 600;
-    color: #7c5cfc;
+    color: var(--accent-primary);
     min-width: 36px;
     text-align: right;
   }
@@ -217,27 +256,29 @@ HTML = """<!DOCTYPE html>
     width: 100%;
     margin-top: 16px;
     padding: 14px;
-    background: #7c5cfc;
-    color: #fff;
-    border: none;
-    border-radius: 10px;
+    background: var(--accent-primary);
+    color: var(--bg-primary);
+    border: 1px solid var(--accent-primary);
+    border-radius: var(--radius);
+    font-family: 'Inter', sans-serif;
     font-size: 1rem;
     font-weight: 700;
     cursor: pointer;
-    transition: background 0.15s, transform 0.1s;
+    transition: all var(--transition);
     letter-spacing: 0.01em;
   }
 
-  .convert-btn:hover { background: #6a48f0; }
-  .convert-btn:active { transform: scale(0.98); }
-  .convert-btn:disabled { background: #333; color: #666; cursor: not-allowed; }
+  .convert-btn:hover:not(:disabled) { background: transparent; color: var(--accent-primary); }
+  .convert-btn:active:not(:disabled) { transform: scale(0.98); }
+  .convert-btn:disabled { background: var(--bg-tertiary); border-color: var(--border-color); color: var(--text-muted); cursor: not-allowed; }
 
   /* Progress */
   .progress-section {
     display: none;
     margin-top: 16px;
-    background: #16161e;
-    border-radius: 14px;
+    background: var(--bg-secondary);
+    border-radius: var(--radius);
+    border: 1px solid var(--border-color);
     padding: 20px;
   }
 
@@ -245,20 +286,21 @@ HTML = """<!DOCTYPE html>
 
   .progress-label {
     font-size: 0.85rem;
-    color: #999;
+    font-weight: 500;
+    color: var(--text-secondary);
     margin-bottom: 10px;
   }
 
   .progress-bar-wrap {
-    background: #0f0f13;
+    background: var(--bg-primary);
     border-radius: 6px;
-    height: 8px;
+    height: 6px;
     overflow: hidden;
   }
 
   .progress-bar {
     height: 100%;
-    background: linear-gradient(90deg, #7c5cfc, #5c9cfc);
+    background: linear-gradient(90deg, var(--accent-primary), var(--accent-success));
     border-radius: 6px;
     width: 0%;
     transition: width 0.3s;
@@ -278,68 +320,88 @@ HTML = """<!DOCTYPE html>
   .result-section {
     display: none;
     margin-top: 16px;
-    background: #16161e;
-    border-radius: 14px;
+    background: var(--bg-secondary);
+    border-radius: var(--radius);
+    border: 1px solid var(--border-color);
     padding: 20px;
     text-align: center;
   }
 
-  .result-section.visible { display: block; }
+  .result-section.visible { display: block; animation: flash-success 0.6s ease; }
 
   .result-section img {
     max-width: 100%;
     max-height: 320px;
-    border-radius: 8px;
+    border-radius: 6px;
     margin-bottom: 14px;
-    border: 1px solid #2a2a35;
+    border: 1px solid var(--border-color);
   }
 
   .result-meta {
     font-size: 0.8rem;
-    color: #666;
+    font-weight: 500;
+    color: var(--text-muted);
     margin-bottom: 14px;
   }
 
   .download-btn {
-    display: inline-block;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
     padding: 10px 24px;
-    background: #1e3a5f;
-    color: #7cb4fc;
-    border-radius: 8px;
+    background: var(--accent-primary);
+    color: var(--bg-primary);
+    border-radius: var(--radius);
     text-decoration: none;
     font-weight: 600;
     font-size: 0.9rem;
-    transition: background 0.15s;
-    border: 1px solid #2a4a7f;
+    transition: all var(--transition);
+    border: 1px solid var(--accent-primary);
   }
 
-  .download-btn:hover { background: #25487a; }
+  .download-btn:hover { background: transparent; color: var(--accent-primary); }
 
   .error-msg {
-    color: #fc5c7c;
+    color: var(--accent-secondary);
     font-size: 0.85rem;
+    font-weight: 500;
     margin-top: 8px;
   }
 
   .reset-btn {
-    background: none;
-    border: 1px solid #333;
-    color: #888;
-    border-radius: 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-color);
+    color: var(--text-secondary);
+    border-radius: var(--radius);
     padding: 8px 16px;
-    font-size: 0.82rem;
+    font-family: 'Inter', sans-serif;
+    font-size: 0.85rem;
+    font-weight: 500;
     cursor: pointer;
     margin-top: 10px;
-    transition: all 0.15s;
+    transition: all var(--transition);
   }
 
-  .reset-btn:hover { border-color: #555; color: #ccc; }
+  .reset-btn:hover { border-color: var(--accent-primary); color: var(--accent-primary); background: var(--bg-primary); }
+
+  /* Animations */
+  @keyframes flash-success {
+    0%, 100% { box-shadow: none; }
+    50% { box-shadow: 0 0 20px var(--accent-success); }
+  }
+
+  /* Responsive */
+  @media (max-width: 600px) {
+    body { padding: 12px; }
+    .options { grid-template-columns: 1fr; }
+    h1 { font-size: 1.5rem; }
+  }
 </style>
 </head>
 <body>
 <div class="app">
   <h1>GIF Maker</h1>
-  <p class="subtitle">Convert MP4 to GIF — drop a file and go</p>
+  <p class="subtitle">Drop an MP4 to turn it into a GIF</p>
 
   <!-- Drop Zone -->
   <div class="drop-zone" id="dropZone">
