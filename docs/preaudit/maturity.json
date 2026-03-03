@@ -1,0 +1,46 @@
+{
+  "audit_date": "2026-02-18",
+  "project": "gif-maker",
+  "dimensions": {
+    "loc_discipline": {
+      "score": 0,
+      "max": 3,
+      "evidence": "app.py = 919 LOC (3x over 300-line limit). HTML/CSS/JS/server/business logic all in one file.",
+      "threshold_violated": ">500 LOC"
+    },
+    "validation_coverage": {
+      "score": 0,
+      "max": 3,
+      "evidence": "No Pydantic, no JSON Schema. Inputs (fps, width, encoder, loop, start, end) cast with raw int()/float(). No file size or MIME type checks.",
+      "routes_with_schema": "0/4 (0%)"
+    },
+    "secrets_hygiene": {
+      "score": 3,
+      "max": 3,
+      "evidence": "Zero credentials in codebase. Localhost-only tool, no external APIs. PORT hardcoded but acceptable.",
+      "verdict": "CLEAN"
+    },
+    "state_persistence": {
+      "score": 0,
+      "max": 3,
+      "evidence": "jobs={} module-level dict. All job state lost on restart. No idempotency. Unbounded growth.",
+      "durable": "GIF files on disk only"
+    },
+    "errors_retry_idempotency": {
+      "score": 1,
+      "max": 3,
+      "evidence": "try/except in run_conversion and do_POST. finally block for cleanup. No retries. No structured errors. Frontend fetch in pollJob has no error handler.",
+      "strengths": ["temp file cleanup", "subprocess timeout", "gifski trim fallback"]
+    },
+    "testing_ci": {
+      "score": 0,
+      "max": 3,
+      "evidence": "Zero test files. No CI configuration. No requirements.txt. No coverage tooling.",
+      "test_files": 0,
+      "ci_workflows": 0
+    }
+  },
+  "total_score": 4,
+  "max_score": 18,
+  "maturity_pct": 22
+}

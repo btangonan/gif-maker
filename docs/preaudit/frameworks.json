@@ -1,0 +1,17 @@
+{
+  "web_framework": "Python stdlib http.server + socketserver.TCPServer",
+  "routes": [
+    { "method": "GET",  "path": "/",              "handler": "do_GET → HTML string response" },
+    { "method": "GET",  "path": "/status/<id>",   "handler": "do_GET → JSON job status lookup" },
+    { "method": "GET",  "path": "/output/<file>", "handler": "do_GET → serve GIF bytes from disk" },
+    { "method": "POST", "path": "/convert",       "handler": "do_POST → parse multipart, spawn thread" }
+  ],
+  "encoders": [
+    { "id": "ffmpeg-high", "description": "2-pass palette (default)" },
+    { "id": "ffmpeg-med",  "description": "Single-pass ffmpeg" },
+    { "id": "gifski",      "description": "gifski binary (optional dep)" },
+    { "id": "libvips",     "description": "pyvips Python binding (optional dep)" }
+  ],
+  "validators": [],
+  "serialization": "json.dumps / json.loads (stdlib)"
+}

@@ -1,0 +1,25 @@
+{
+  "type": "single-repo",
+  "structure": "monolithic-single-file",
+  "languages": ["Python 3", "HTML", "CSS", "JavaScript"],
+  "frameworks": {
+    "backend": "Python stdlib http.server",
+    "frontend": "Vanilla JS (embedded string in app.py)"
+  },
+  "entry_point": "app.py (if __name__ == '__main__')",
+  "external_tools": ["ffmpeg", "ffprobe", "gifski (optional)", "libvips/pyvips (optional)"],
+  "python_deps": {
+    "stdlib_only": true,
+    "optional": ["pyvips"],
+    "requirements_txt": false,
+    "pyproject_toml": false
+  },
+  "infrastructure": {
+    "docker": false,
+    "ci_cd": false,
+    "env_file": false,
+    "cloud": false
+  },
+  "target_env": "macOS localhost (Darwin 24.x, Apple Silicon)",
+  "port": 7878
+}

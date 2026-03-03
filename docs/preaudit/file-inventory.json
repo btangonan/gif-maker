@@ -1,0 +1,22 @@
+{
+  "total_files": 9,
+  "source_files": [
+    { "path": "app.py", "loc": 919, "over_300": true, "over_500": true }
+  ],
+  "config_files": [
+    { "path": ".gitignore", "loc": 12 },
+    { "path": ".mcp.json", "loc": 30 },
+    { "path": "CLAUDE.md", "loc": 55 },
+    { "path": "MEMORY_CHECKPOINT_REMINDER.md", "loc": 5 }
+  ],
+  "script_files": [
+    { "path": "launch-claude-here.command", "loc": "unknown" },
+    { "path": "setup-claude-chroma.command", "loc": "unknown" }
+  ],
+  "doc_files": [
+    { "path": "claudedocs/INIT_INSTRUCTIONS.md", "loc": "unknown" },
+    { "path": "templates/CLAUDE.md.tpl", "loc": "unknown" }
+  ],
+  "test_files": [],
+  "ci_files": []
+}
