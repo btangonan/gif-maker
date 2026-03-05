@@ -34,6 +34,8 @@ HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>GIF Maker</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="shortcut icon" href="/favicon.svg">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
@@ -647,6 +649,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         if path == "/" or path == "/index.html":
             self._send(200, "text/html", HTML.encode())
+
+        elif path == "/favicon.svg":
+            svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#0a0a0a"/><text x="16" y="26" font-family="\'Inter\', system-ui, -apple-system, sans-serif" font-size="30" font-weight="900" fill="#c8ff00" text-anchor="middle">G</text></svg>'
+            self._send(200, "image/svg+xml", svg.encode())
 
         elif path.startswith("/status/"):
             job_id = path.split("/")[-1]
