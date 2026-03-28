@@ -65,9 +65,9 @@ HTML = """<!DOCTYPE html>
     color: var(--text-primary);
     min-height: 100vh;
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     justify-content: center;
-    padding: 24px;
+    padding: 48px 24px 24px;
     overflow-x: hidden;
   }
 
@@ -339,6 +339,10 @@ HTML = """<!DOCTYPE html>
     border: 1px solid var(--border-color);
   }
 
+  .result-section img.checkerboard {
+    background: repeating-conic-gradient(#e0e0e0 0% 25%, #fff 0% 50%) 0 0 / 16px 16px;
+  }
+
   .result-meta {
     font-size: 0.8rem;
     font-weight: 500;
@@ -465,6 +469,14 @@ HTML = """<!DOCTYPE html>
         <option value="2">Twice</option>
       </select>
     </div>
+
+    <div class="option-group">
+      <label>Transparent</label>
+      <select id="transparent">
+        <option value="0" selected>Off</option>
+        <option value="1">On</option>
+      </select>
+    </div>
   </div>
 
   <button class="convert-btn" id="convertBtn" disabled>Select a video first</button>
@@ -565,6 +577,7 @@ convertBtn.addEventListener('click', async () => {
   formData.append('end', document.getElementById('endTime').value || '');
   formData.append('encoder', document.getElementById('encoder').value);
   formData.append('loop', document.getElementById('loop').value);
+  formData.append('transparent', document.getElementById('transparent').value);
 
   try {
     const res = await fetch('/convert', { method: 'POST', body: formData });
@@ -599,6 +612,11 @@ function showResult(data) {
   progressSection.classList.remove('visible');
   resultSection.classList.add('visible');
   resultGif.src = data.url + '?t=' + Date.now();
+  if (data.transparent) {
+    resultGif.classList.add('checkerboard');
+  } else {
+    resultGif.classList.remove('checkerboard');
+  }
   const encoderLabel = {'ffmpeg-high':'ffmpeg (2-pass)','libvips':'libvips','ffmpeg-med':'ffmpeg'}[data.encoder] || data.encoder;
   resultMeta.textContent = `${data.width}×${data.height} · ${data.size} · ${data.frames} frames · ${data.fps} fps · ${encoderLabel}`;
   downloadBtn.href = data.url;
@@ -631,6 +649,7 @@ resetBtn.addEventListener('click', () => {
   convertBtn.disabled = true;
   convertBtn.textContent = 'Select a video first';
   resultSection.classList.remove('visible');
+  resultGif.classList.remove('checkerboard');
   progressSection.classList.remove('visible');
 });
 </script>
@@ -801,6 +820,11 @@ def run_conversion(job_id: str, params: dict):
         end       = params.get("end", "").strip()
         encoder   = params.get("encoder", "ffmpeg-high")
         loop      = int(params.get("loop", "0"))
+        transparent = params.get("transparent", "0") == "1"
+
+        # ffmpeg single-pass cannot produce transparent GIFs; auto-upgrade
+        if transparent and encoder == "ffmpeg-med":
+            encoder = "ffmpeg-high"
 
         output_name = f"{job_id}.gif"
         output_path = str(OUTPUT_DIR / output_name)
@@ -828,10 +852,12 @@ def run_conversion(job_id: str, params: dict):
             frames_dir = tempfile.mkdtemp()
             update("Extracting frames…")
             frame_pattern = os.path.join(frames_dir, "frame%05d.png")
+            pix_fmt_args = ["-pix_fmt", "rgba"] if transparent else []
             extract_cmd = [
                 "ffmpeg", "-y", *time_args,
                 "-i", input_path,
                 "-vf", vf_base,
+                *pix_fmt_args,
                 frame_pattern
             ]
             r = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=180)
@@ -861,18 +887,20 @@ def run_conversion(job_id: str, params: dict):
         elif encoder == "ffmpeg-high":
             update("Generating color palette…")
             palette_path = str(OUTPUT_DIR / f"{job_id}_palette.png")
+            reserve = "1" if transparent else "0"
             r = subprocess.run(
                 ["ffmpeg", "-y", *time_args, "-i", input_path,
-                 "-vf", f"{vf_base},palettegen=stats_mode=diff", palette_path],
+                 "-vf", f"{vf_base},palettegen=stats_mode=diff:reserve_transparent={reserve}", palette_path],
                 capture_output=True, text=True, timeout=120
             )
             if r.returncode != 0:
                 raise RuntimeError(f"Palette generation failed:\n{r.stderr[-800:]}")
 
             update("Rendering GIF…")
+            alpha_opt = ":alpha_threshold=128" if transparent else ""
             result = subprocess.run(
                 ["ffmpeg", "-y", *time_args, "-i", input_path, "-i", palette_path,
-                 "-lavfi", f"{vf_base} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle",
+                 "-lavfi", f"{vf_base} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle{alpha_opt}",
                  "-loop", str(loop), output_path],
                 capture_output=True, text=True, timeout=300
             )
@@ -918,6 +946,7 @@ def run_conversion(job_id: str, params: dict):
             "frames": frames_count,
             "fps": fps,
             "encoder": encoder,
+            "transparent": transparent,
         }
 
     except Exception as e:
