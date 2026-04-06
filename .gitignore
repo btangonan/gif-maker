@@ -15,3 +15,15 @@ tmp/
 
 # ChromaDB local data
 .chroma/
+
+# Claude operational files
+CLAUDE.md*
+.claude/
+.mcp.json*
+STATE.md
+MEMORY_CHECKPOINT_REMINDER.md
+backups/
+templates/
+claudedocs/
+*.command
+.coverage
