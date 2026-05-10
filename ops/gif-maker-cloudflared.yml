@@ -1,0 +1,7 @@
+tunnel: 69c18133-7b90-425c-9f32-4a1989cb0041
+credentials-file: /Users/bradleytangonan/.cloudflared/69c18133-7b90-425c-9f32-4a1989cb0041.json
+
+ingress:
+  - hostname: gif.tangonan.dev
+    service: http://127.0.0.1:7878
+  - service: http_status:404

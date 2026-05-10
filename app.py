@@ -8,6 +8,7 @@ Then open: http://localhost:7878
 import http.server
 import socketserver
 import json
+import math
 import os
 import subprocess
 import sys
@@ -18,8 +19,20 @@ import urllib.parse
 from pathlib import Path
 
 PORT = int(os.environ.get("PORT", 7878))
-MAX_UPLOAD_BYTES = 150 * 1024 * 1024  # 150 MB
+HOST = os.environ.get("HOST", "127.0.0.1")
+# Cloudflare-proxied requests are commonly capped at 100 MB on Free/Pro plans.
+# Keep the app default just below that; override with MAX_UPLOAD_MB for other hosts.
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "95"))
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_JOBS = 500
+MAX_CONCURRENT_CONVERSIONS = int(os.environ.get("MAX_CONCURRENT_CONVERSIONS", "1"))
+MAX_DURATION_SECONDS = float(os.environ.get("MAX_DURATION_SECONDS", "30"))
+MAX_OUTPUT_FRAMES = int(os.environ.get("MAX_OUTPUT_FRAMES", "900"))
+ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
+ALLOWED_MIME_PREFIXES = ("video/", "application/octet-stream")
+ALLOWED_ENCODERS = {"gifski", "libvips", "ffmpeg-high", "ffmpeg-med"}
+ALLOWED_WIDTHS = {"original", "800", "640", "480", "320"}
+ALLOWED_LOOPS = {0, 1, 2}
 BASE_DIR = Path(__file__).parent
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -27,6 +40,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 # Track job progress
 jobs = {}
 jobs_lock = threading.Lock()
+conversion_slots = threading.BoundedSemaphore(MAX_CONCURRENT_CONVERSIONS)
 
 HTML = """<!DOCTYPE html>
 <html lang="en">
@@ -407,14 +421,14 @@ HTML = """<!DOCTYPE html>
 <body>
 <div class="app">
   <h1>GIF Maker</h1>
-  <p class="subtitle">Drop an MP4 to make a GIF</p>
+  <p class="subtitle">Drop a video to make a GIF</p>
 
   <!-- Drop Zone -->
   <div class="drop-zone" id="dropZone">
     <input type="file" id="fileInput" accept="video/mp4,video/*">
     <span class="drop-icon" id="dropIcon"></span>
-    <div class="drop-label" id="dropLabel">Drop MP4 here or click to browse</div>
-    <div class="drop-hint" id="dropHint">.mp4, .mov, .webm supported</div>
+    <div class="drop-label" id="dropLabel">Drop video here or click to browse</div>
+    <div class="drop-hint" id="dropHint">.mp4, .mov, .m4v, .webm supported · max __MAX_UPLOAD_MB__ MB</div>
     <div class="file-info" id="fileInfo">
       <span class="file-name" id="fileName"></span>
       <span class="file-size" id="fileSize"></span>
@@ -456,6 +470,7 @@ HTML = """<!DOCTYPE html>
       <label>Encoder</label>
       <select id="encoder">
         <option value="ffmpeg-high" selected>ffmpeg (2-pass palette)</option>
+        <option value="gifski">Gifski (best quality)</option>
         <option value="libvips">libvips</option>
         <option value="ffmpeg-med">ffmpeg</option>
       </select>
@@ -525,6 +540,8 @@ const resetBtn = document.getElementById('resetBtn');
 const fps = document.getElementById('fps');
 const fpsVal = document.getElementById('fpsVal');
 fps.addEventListener('input', () => fpsVal.textContent = fps.value);
+const MAX_UPLOAD_MB = __MAX_UPLOAD_MB__;
+const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 
 // Drag & drop
 dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
@@ -540,6 +557,12 @@ fileInput.addEventListener('change', () => {
 });
 
 function setFile(file) {
+  if (file.size > MAX_UPLOAD_BYTES) {
+    clearSelection();
+    showError(`File too large. Max upload is ${MAX_UPLOAD_MB} MB.`);
+    fileInput.value = '';
+    return;
+  }
   selectedFile = file;
   dropZone.classList.add('has-file');
   dropIcon.textContent = '';
@@ -551,6 +574,20 @@ function setFile(file) {
   convertBtn.disabled = false;
   convertBtn.textContent = 'Convert to GIF →';
   resultSection.classList.remove('visible');
+}
+
+function clearSelection() {
+  selectedFile = null;
+  fileInput.value = '';
+  dropZone.classList.remove('has-file');
+  dropIcon.textContent = '';
+  dropLabel.style.display = '';
+  dropHint.style.display = '';
+  fileInfo.classList.remove('visible');
+  fileName.textContent = '';
+  fileSize.textContent = '';
+  convertBtn.disabled = true;
+  convertBtn.textContent = 'Select a video first';
 }
 
 function formatBytes(b) {
@@ -593,17 +630,25 @@ convertBtn.addEventListener('click', async () => {
 
 function pollJob() {
   pollTimer = setInterval(async () => {
-    const res = await fetch('/status/' + jobId);
-    const data = await res.json();
+    try {
+      const res = await fetch('/status/' + jobId);
+      const data = await res.json();
 
-    if (data.status === 'done') {
+      if (data.status === 'done') {
+        clearInterval(pollTimer);
+        showResult(data);
+      } else if (data.status === 'error') {
+        clearInterval(pollTimer);
+        showError(data.error);
+      } else if (data.status === 'unknown') {
+        clearInterval(pollTimer);
+        showError('Conversion status expired. Please try again.');
+      } else {
+        if (data.step) progressLabel.textContent = data.step;
+      }
+    } catch(e) {
       clearInterval(pollTimer);
-      showResult(data);
-    } else if (data.status === 'error') {
-      clearInterval(pollTimer);
-      showError(data.error);
-    } else {
-      if (data.step) progressLabel.textContent = data.step;
+      showError('Network error while checking conversion status. Please try again.');
     }
   }, 800);
 }
@@ -617,7 +662,7 @@ function showResult(data) {
   } else {
     resultGif.classList.remove('checkerboard');
   }
-  const encoderLabel = {'ffmpeg-high':'ffmpeg (2-pass)','libvips':'libvips','ffmpeg-med':'ffmpeg'}[data.encoder] || data.encoder;
+  const encoderLabel = {'gifski':'Gifski','ffmpeg-high':'ffmpeg (2-pass)','libvips':'libvips','ffmpeg-med':'ffmpeg'}[data.encoder] || data.encoder;
   resultMeta.textContent = `${data.width}×${data.height} · ${data.size} · ${data.frames} frames · ${data.fps} fps · ${encoderLabel}`;
   downloadBtn.href = data.url;
   downloadBtn.download = data.filename;
@@ -625,7 +670,7 @@ function showResult(data) {
   convertBtn.textContent = 'Convert Again';
 }
 
-function showError(msg) {
+function showError(msg, canRetry = Boolean(selectedFile)) {
   progressSection.classList.remove('visible');
   // Clear any existing error before inserting a new one
   document.querySelectorAll('.error-msg').forEach(el => el.remove());
@@ -633,21 +678,13 @@ function showError(msg) {
   err.className = 'error-msg';
   err.textContent = msg;
   convertBtn.parentNode.insertBefore(err, convertBtn.nextSibling);
-  convertBtn.disabled = false;
-  convertBtn.textContent = 'Try Again';
+  convertBtn.disabled = !canRetry;
+  convertBtn.textContent = canRetry ? 'Try Again' : 'Select a video first';
   setTimeout(() => err.remove(), 8000);
 }
 
 resetBtn.addEventListener('click', () => {
-  selectedFile = null;
-  fileInput.value = '';
-  dropZone.classList.remove('has-file');
-  dropIcon.textContent = '';
-  dropLabel.style.display = '';
-  dropHint.style.display = '';
-  fileInfo.classList.remove('visible');
-  convertBtn.disabled = true;
-  convertBtn.textContent = 'Select a video first';
+  clearSelection();
   resultSection.classList.remove('visible');
   resultGif.classList.remove('checkerboard');
   progressSection.classList.remove('visible');
@@ -667,7 +704,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
 
         if path == "/" or path == "/index.html":
-            self._send(200, "text/html", HTML.encode())
+            html = HTML.replace("__MAX_UPLOAD_MB__", str(MAX_UPLOAD_MB))
+            self._send(200, "text/html", html.encode())
+
+        elif path == "/healthz":
+            self._json(200, {"ok": True})
 
         elif path == "/favicon.svg":
             svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#0a0a0a"/><text x="16" y="26" font-family="\'Inter\', system-ui, -apple-system, sans-serif" font-size="30" font-weight="900" fill="#c8ff00" text-anchor="middle">G</text></svg>'
@@ -675,7 +716,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         elif path.startswith("/status/"):
             job_id = path.split("/")[-1]
-            job = jobs.get(job_id, {"status": "unknown"})
+            with jobs_lock:
+                job = jobs.get(job_id, {"status": "unknown"})
             self._json(200, job)
 
         elif path.startswith("/output/"):
@@ -696,32 +738,51 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         if self.path == "/convert":
-            content_length = int(self.headers.get("Content-Length", 0))
+            try:
+                content_length = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._json(400, {"error": "Invalid Content-Length."})
+                return
             if content_length > MAX_UPLOAD_BYTES:
-                self._json(413, {"error": f"File too large. Max upload is 150 MB."})
+                self._json(413, {"error": f"File too large. Max upload is {MAX_UPLOAD_MB} MB."})
+                return
+            if content_length <= 0:
+                self._json(400, {"error": "Empty upload."})
                 return
             content_type = self.headers.get("Content-Type", "")
             body = self.rfile.read(content_length)
 
-            job_id = str(uuid.uuid4())[:8]
-            with jobs_lock:
-                if len(jobs) >= MAX_JOBS:
-                    oldest = list(jobs.keys())[:50]
-                    for k in oldest:
-                        jobs.pop(k, None)
-                jobs[job_id] = {"status": "queued", "step": "Queued…"}
-
             # Parse multipart
             try:
                 params = parse_multipart(body, content_type)
+                params = validate_params(params)
             except Exception as e:
-                self._json(400, {"error": f"Upload parse error: {e}"})
+                self._json(400, {"error": str(e)})
                 return
+
+            if not conversion_slots.acquire(blocking=False):
+                self._json(503, {"error": "Another conversion is running. Please try again shortly."})
+                return
+
+            job_id = str(uuid.uuid4())[:8]
+            with jobs_lock:
+                if len(jobs) >= MAX_JOBS:
+                    evictable = [k for k, v in list(jobs.items())
+                                 if isinstance(v, dict) and v.get("status") in ("done", "error")]
+                    for k in evictable[:50]:
+                        gif = OUTPUT_DIR / f"{k}.gif"
+                        gif.unlink(missing_ok=True)
+                        jobs.pop(k, None)
+                if len(jobs) >= MAX_JOBS:
+                    self._json(503, {"error": "Server is busy. Please try again shortly."})
+                    conversion_slots.release()
+                    return
+                jobs[job_id] = {"status": "queued", "step": "Queued…"}
 
             self._json(200, {"job_id": job_id})
 
             # Run conversion in background thread
-            t = threading.Thread(target=run_conversion, args=(job_id, params), daemon=True)
+            t = threading.Thread(target=run_conversion, args=(job_id, params, True), daemon=True)
             t.start()
 
         else:
@@ -773,6 +834,7 @@ def parse_multipart(body: bytes, content_type: str) -> dict:
         headers_str = headers_raw.decode("utf-8", errors="replace")
         name = None
         filename = None
+        part_content_type = ""
         for line in headers_str.splitlines():
             if "Content-Disposition" in line:
                 for seg in line.split(";"):
@@ -781,26 +843,158 @@ def parse_multipart(body: bytes, content_type: str) -> dict:
                         name = seg[5:].strip('"')
                     elif seg.startswith("filename="):
                         filename = seg[9:].strip('"')
+            elif line.lower().startswith("content-type:"):
+                part_content_type = line.split(":", 1)[1].strip().lower()
 
         if name:
             if filename:
-                result[name] = {"filename": filename, "data": content}
+                result[name] = {
+                    "filename": filename,
+                    "content_type": part_content_type,
+                    "data": content,
+                }
             else:
                 result[name] = content.decode("utf-8", errors="replace").strip()
 
     return result
 
 
-def run_conversion(job_id: str, params: dict):
+def _parse_int(value, default, minimum=None, maximum=None):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _parse_time(value, label):
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        parsed = float(value)
+    except ValueError:
+        raise ValueError(f"{label} time must be a number of seconds")
+    if parsed < 0:
+        raise ValueError(f"{label} time must be 0 or greater")
+    return str(parsed)
+
+
+def validate_params(params: dict) -> dict:
+    video_data = params.get("video")
+    if not video_data or not isinstance(video_data, dict):
+        raise ValueError("No video file received")
+
+    filename = video_data.get("filename") or ""
+    suffix = Path(filename).suffix.lower()
+    if suffix not in ALLOWED_EXTENSIONS:
+        allowed = ", ".join(sorted(ALLOWED_EXTENSIONS))
+        raise ValueError(f"Unsupported video type. Use one of: {allowed}")
+
+    content_type = (video_data.get("content_type") or "application/octet-stream").lower()
+    if not content_type.startswith(ALLOWED_MIME_PREFIXES):
+        raise ValueError("Unsupported upload content type")
+
+    if len(video_data.get("data", b"")) > MAX_UPLOAD_BYTES:
+        raise ValueError(f"File too large. Max upload is {MAX_UPLOAD_MB} MB.")
+
+    fps = _parse_int(params.get("fps", "15"), default=15, minimum=1, maximum=30)
+    width_opt = (params.get("width", "640") or "640").strip()
+    if width_opt not in ALLOWED_WIDTHS:
+        raise ValueError("Unsupported width option")
+
+    encoder = (params.get("encoder", "ffmpeg-high") or "ffmpeg-high").strip()
+    if encoder not in ALLOWED_ENCODERS:
+        raise ValueError("Unsupported encoder option")
+
+    loop = _parse_int(params.get("loop", "0"), default=0)
+    if loop not in ALLOWED_LOOPS:
+        raise ValueError("Unsupported loop option")
+
+    start = _parse_time(params.get("start", ""), "Start")
+    end = _parse_time(params.get("end", ""), "End")
+    if start and end and float(end) <= float(start):
+        raise ValueError("End time must be greater than start time")
+
+    transparent = params.get("transparent", "0") == "1"
+
+    return {
+        "video": video_data,
+        "fps": fps,
+        "width": width_opt,
+        "start": start,
+        "end": end,
+        "encoder": encoder,
+        "loop": loop,
+        "transparent": transparent,
+    }
+
+
+def loop_values(ui_loop: int) -> tuple[int, int]:
+    """Return loop values for ffmpeg/libvips and gifski."""
+    # UI: 0 = forever, 1 = play once, 2 = play twice.
+    # ffmpeg/libvips store extra loops after the first play; gifski uses
+    # -1 for no repeat and positive values for additional repeats.
+    ffmpeg_loop = {0: 0, 1: -1, 2: 1}.get(ui_loop, 0)
+    gifski_repeat = {0: 0, 1: -1, 2: 1}.get(ui_loop, 0)
+    return ffmpeg_loop, gifski_repeat
+
+
+def probe_duration(input_path: str) -> float:
+    result = subprocess.run(
+        [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            input_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise ValueError("Invalid or unsupported video file")
+    try:
+        duration = float(result.stdout.strip())
+    except ValueError:
+        raise ValueError("Could not read video duration")
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("Could not read video duration")
+    return duration
+
+
+def enforce_clip_limits(source_duration: float, start: str, end: str, fps: int):
+    start_s = float(start) if start else 0.0
+    end_s = float(end) if end else source_duration
+    if start_s >= source_duration:
+        raise ValueError("Start time is beyond the end of the video")
+    clip_duration = min(end_s, source_duration) - start_s
+    if clip_duration <= 0:
+        raise ValueError("Selected clip has no duration")
+    if clip_duration > MAX_DURATION_SECONDS:
+        raise ValueError(f"Clip is too long. Max duration is {MAX_DURATION_SECONDS:g} seconds.")
+    estimated_frames = math.ceil(clip_duration * fps)
+    if estimated_frames > MAX_OUTPUT_FRAMES:
+        raise ValueError(f"Clip has too many frames. Max output is {MAX_OUTPUT_FRAMES} frames.")
+    return clip_duration, estimated_frames
+
+
+def run_conversion(job_id: str, params: dict, release_slot: bool = False):
     import tempfile
     import shutil
 
     def update(step, **extra):
-        jobs[job_id] = {"status": "running", "step": step, **extra}
+        with jobs_lock:
+            jobs[job_id] = {"status": "running", "step": step, **extra}
 
     input_path = None
     palette_path = None
     frames_dir = None
+    trimmed_path = None
     try:
         update("Saving uploaded video…")
 
@@ -808,19 +1002,22 @@ def run_conversion(job_id: str, params: dict):
         if not video_data or not isinstance(video_data, dict):
             raise ValueError("No video file received")
 
-        suffix = Path(video_data["filename"]).suffix or ".mp4"
+        suffix = Path(video_data["filename"]).suffix.lower() or ".mp4"
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
             f.write(video_data["data"])
             input_path = f.name
 
         # Options
-        fps       = int(params.get("fps", "15"))
-        width_opt = params.get("width", "640")
-        start     = params.get("start", "").strip()
-        end       = params.get("end", "").strip()
-        encoder   = params.get("encoder", "ffmpeg-high")
-        loop      = int(params.get("loop", "0"))
-        transparent = params.get("transparent", "0") == "1"
+        fps = params["fps"]
+        width_opt = params["width"]
+        start = params["start"]
+        end = params["end"]
+        encoder = params["encoder"]
+        loop = params["loop"]
+        transparent = params["transparent"]
+        ffmpeg_loop, gifski_repeat = loop_values(loop)
+        source_duration = probe_duration(input_path)
+        clip_duration, estimated_frames = enforce_clip_limits(source_duration, start, end, fps)
 
         # ffmpeg single-pass cannot produce transparent GIFs; auto-upgrade
         if transparent and encoder == "ffmpeg-med":
@@ -842,12 +1039,54 @@ def run_conversion(job_id: str, params: dict):
             time_args += ["-ss", start]
         if end:
             if start:
-                time_args += ["-t", str(float(end) - float(start))]
+                time_args += ["-t", str(clip_duration)]
             else:
                 time_args += ["-to", end]
+        elif start:
+            time_args += ["-t", str(clip_duration)]
+
+        # ── Gifski ────────────────────────────────────────────────────────────
+        if encoder == "gifski":
+            update("Encoding with Gifski…")
+            gifski_cmd = [
+                "gifski",
+                "--fps", str(fps),
+                "--quality", "90",
+                "--repeat", str(gifski_repeat),
+                "-o", output_path,
+            ]
+            if width_opt != "original":
+                gifski_cmd += ["-W", width_opt]
+            # gifski handles trim via ffmpeg pre-pass if time args needed
+            if time_args:
+                update("Trimming clip…")
+                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+                    trimmed_path = tf.name
+                trim_cmd = [
+                    "ffmpeg", "-y", *time_args,
+                    "-i", input_path,
+                    "-c", "copy", trimmed_path
+                ]
+                r = subprocess.run(trim_cmd, capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    # fallback: re-encode trim
+                    trim_cmd = ["ffmpeg", "-y", *time_args, "-i", input_path, trimmed_path]
+                    r = subprocess.run(trim_cmd, capture_output=True, text=True, timeout=120)
+                if r.returncode != 0:
+                    raise RuntimeError(f"Trim failed:\n{r.stderr[-800:]}")
+                gifski_cmd.append(trimmed_path)
+                update("Encoding with Gifski…")
+                result = subprocess.run(gifski_cmd, capture_output=True, text=True, timeout=300)
+                os.unlink(trimmed_path)
+                trimmed_path = None
+            else:
+                gifski_cmd.append(input_path)
+                result = subprocess.run(gifski_cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                raise RuntimeError(f"Gifski failed:\n{result.stderr[-800:]}")
 
         # ── libvips ───────────────────────────────────────────────────────────
-        if encoder == "libvips":
+        elif encoder == "libvips":
             import glob as globmod
             frames_dir = tempfile.mkdtemp()
             update("Extracting frames…")
@@ -880,7 +1119,7 @@ def run_conversion(job_id: str, params: dict):
             delay_ms = max(10, round(1000 / fps))
             joined.set_type(pyvips.GValue.array_int_type, "delay", [delay_ms] * len(images))
             joined.set_type(pyvips.GValue.gint_type, "page-height", images[0].height)
-            joined.set_type(pyvips.GValue.gint_type, "loop", loop)
+            joined.set_type(pyvips.GValue.gint_type, "loop", ffmpeg_loop)
             joined.gifsave(output_path, effort=7, dither=1.0)
 
         # ── ffmpeg high (2-pass palette) ──────────────────────────────────────
@@ -901,7 +1140,7 @@ def run_conversion(job_id: str, params: dict):
             result = subprocess.run(
                 ["ffmpeg", "-y", *time_args, "-i", input_path, "-i", palette_path,
                  "-lavfi", f"{vf_base} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle{alpha_opt}",
-                 "-loop", str(loop), output_path],
+                 "-loop", str(ffmpeg_loop), output_path],
                 capture_output=True, text=True, timeout=300
             )
             if result.returncode != 0:
@@ -912,7 +1151,7 @@ def run_conversion(job_id: str, params: dict):
             update("Rendering GIF…")
             result = subprocess.run(
                 ["ffmpeg", "-y", *time_args, "-i", input_path,
-                 "-vf", vf_base, "-loop", str(loop), output_path],
+                 "-vf", vf_base, "-loop", str(ffmpeg_loop), output_path],
                 capture_output=True, text=True, timeout=300
             )
             if result.returncode != 0:
@@ -936,21 +1175,27 @@ def run_conversion(job_id: str, params: dict):
         if len(parts_out) >= 3 and parts_out[2].strip():
             frames_count = parts_out[2].strip()
 
-        jobs[job_id] = {
-            "status": "done",
-            "url": f"/output/{output_name}",
-            "filename": output_name,
-            "size": size_str,
-            "width": w,
-            "height": h,
-            "frames": frames_count,
-            "fps": fps,
-            "encoder": encoder,
-            "transparent": transparent,
-        }
+        with jobs_lock:
+            if job_id not in jobs:
+                if os.path.exists(output_path):
+                    os.unlink(output_path)
+                return
+            jobs[job_id] = {
+                "status": "done",
+                "url": f"/output/{output_name}",
+                "filename": output_name,
+                "size": size_str,
+                "width": w,
+                "height": h,
+                "frames": frames_count,
+                "fps": fps,
+                "encoder": encoder,
+                "transparent": transparent,
+            }
 
     except Exception as e:
-        jobs[job_id] = {"status": "error", "error": str(e)}
+        with jobs_lock:
+            jobs[job_id] = {"status": "error", "error": str(e)}
     finally:
         if input_path and os.path.exists(input_path):
             try: os.unlink(input_path)
@@ -961,6 +1206,11 @@ def run_conversion(job_id: str, params: dict):
         if frames_dir and os.path.exists(frames_dir):
             try: shutil.rmtree(frames_dir)
             except OSError: pass
+        if trimmed_path and os.path.exists(trimmed_path):
+            try: os.unlink(trimmed_path)
+            except OSError: pass
+        if release_slot:
+            conversion_slots.release()
 
 
 class GifMakerServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
@@ -970,28 +1220,38 @@ class GifMakerServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
 
 
 def _cleanup_loop():
-    """Background thread: delete GIFs and job entries older than 1 hour."""
+    """Background thread: delete GIFs and job entries older than 1 hour, atomically."""
     while True:
         time.sleep(1800)  # run every 30 minutes
         cutoff = time.time() - 3600
+        # Identify expired files outside the lock (disk I/O should not block job state)
+        expired = []
         for fpath in list(OUTPUT_DIR.iterdir()):
             if fpath.suffix == ".gif":
                 try:
                     if fpath.stat().st_mtime < cutoff:
-                        fpath.unlink()
+                        expired.append(fpath)
                 except OSError:
                     pass
-        with jobs_lock:
-            stale = [k for k, v in list(jobs.items())
-                     if isinstance(v, dict) and v.get("status") in ("done", "error")]
-            for k in stale[:-100]:  # keep last 100 completed
-                jobs.pop(k, None)
+        # Delete files outside the lock, collect job IDs to evict
+        evict_ids = []
+        for fpath in expired:
+            try:
+                fpath.unlink()
+                evict_ids.append(fpath.stem)
+            except OSError:
+                pass
+        # Single lock acquisition to batch-evict all job entries
+        if evict_ids:
+            with jobs_lock:
+                for job_id in evict_ids:
+                    jobs.pop(job_id, None)
 
 
 def main():
     threading.Thread(target=_cleanup_loop, daemon=True).start()
 
-    print(f"\n  GIF Maker running at http://0.0.0.0:{PORT}")
+    print(f"\n  GIF Maker running at http://{HOST}:{PORT}")
     is_local = sys.stdout.isatty()
     if is_local:
         import webbrowser
@@ -999,7 +1259,7 @@ def main():
         threading.Timer(0.8, lambda: webbrowser.open(f"http://localhost:{PORT}")).start()
 
     try:
-        with GifMakerServer(("", PORT), Handler) as httpd:
+        with GifMakerServer((HOST, PORT), Handler) as httpd:
             try:
                 httpd.serve_forever()
             except KeyboardInterrupt:

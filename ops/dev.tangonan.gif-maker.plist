@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.tangonan.gif-maker</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/bradleytangonan/Projects/gif-maker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/bradleytangonan/Projects/gif-maker/.venv/bin/python</string>
+    <string>/Users/bradleytangonan/Projects/gif-maker/app.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PORT</key>
+    <string>7878</string>
+    <key>MAX_UPLOAD_MB</key>
+    <string>95</string>
+    <key>MAX_CONCURRENT_CONVERSIONS</key>
+    <string>1</string>
+    <key>MAX_DURATION_SECONDS</key>
+    <string>30</string>
+    <key>MAX_OUTPUT_FRAMES</key>
+    <string>900</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/gif-maker.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/gif-maker.err.log</string>
+</dict>
+</plist>

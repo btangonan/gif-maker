@@ -1,46 +1,47 @@
 {
-  "audit_date": "2026-02-18",
+  "audit_date": "2026-05-09",
   "project": "gif-maker",
+  "prior_audit": "2026-04-03 (6/18)",
   "dimensions": {
     "loc_discipline": {
       "score": 0,
       "max": 3,
-      "evidence": "app.py = 919 LOC (3x over 300-line limit). HTML/CSS/JS/server/business logic all in one file.",
+      "evidence": "app.py remains a single-file app with embedded frontend, HTTP server, multipart parser, and conversion logic.",
       "threshold_violated": ">500 LOC"
     },
     "validation_coverage": {
-      "score": 0,
+      "score": 2,
       "max": 3,
-      "evidence": "No Pydantic, no JSON Schema. Inputs (fps, width, encoder, loop, start, end) cast with raw int()/float(). No file size or MIME type checks.",
-      "routes_with_schema": "0/4 (0%)"
+      "evidence": "Upload size, file extension, MIME prefix, fps, width, encoder, loop, time range, ffprobe-readable duration, max clip duration, and estimated output frames are validated. Actual media trust still relies on ffprobe/native decoders.",
+      "routes_with_schema": "convert route has explicit validation helpers"
     },
     "secrets_hygiene": {
       "score": 3,
       "max": 3,
-      "evidence": "Zero credentials in codebase. Localhost-only tool, no external APIs. PORT hardcoded but acceptable.",
+      "evidence": "No credentials in repo. Cloudflare Tunnel credentials are expected to live outside the repository.",
       "verdict": "CLEAN"
     },
     "state_persistence": {
-      "score": 0,
-      "max": 3,
-      "evidence": "jobs={} module-level dict. All job state lost on restart. No idempotency. Unbounded growth.",
-      "durable": "GIF files on disk only"
-    },
-    "errors_retry_idempotency": {
       "score": 1,
       "max": 3,
-      "evidence": "try/except in run_conversion and do_POST. finally block for cleanup. No retries. No structured errors. Frontend fetch in pollJob has no error handler.",
-      "strengths": ["temp file cleanup", "subprocess timeout", "gifski trim fallback"]
+      "evidence": "jobs dict and output GIFs are local and ephemeral. jobs_lock, cleanup loop, MAX_JOBS, and output TTL reduce growth but do not persist state across restart."
+    },
+    "errors_retry_idempotency": {
+      "score": 2,
+      "max": 3,
+      "evidence": "Server returns clear validation/resource errors. Frontend handles upload/polling/network failures. No retry or idempotency layer.",
+      "strengths": ["temp cleanup", "subprocess timeouts", "frontend polling catch", "conversion slot saturation response"]
     },
     "testing_ci": {
-      "score": 0,
+      "score": 2,
       "max": 3,
-      "evidence": "Zero test files. No CI configuration. No requirements.txt. No coverage tooling.",
-      "test_files": 0,
+      "evidence": "Focused unit tests cover validation, loop values, clip limits, and conversion slot behavior. No CI configuration.",
+      "test_files": 1,
       "ci_workflows": 0
     }
   },
-  "total_score": 4,
+  "total_score": 10,
   "max_score": 18,
-  "maturity_pct": 22
+  "maturity_pct": 56,
+  "delta_from_prior": "+4 (Validation +1, Errors +1, Testing +2)"
 }
