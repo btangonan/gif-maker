@@ -18,6 +18,9 @@ import uuid
 import urllib.parse
 from pathlib import Path
 
+TOOL_PATH_PREFIX = "/opt/homebrew/bin:/usr/local/bin"
+os.environ["PATH"] = f"{TOOL_PATH_PREFIX}:{os.environ.get('PATH', os.defpath)}"
+
 PORT = int(os.environ.get("PORT", 7878))
 HOST = os.environ.get("HOST", "127.0.0.1")
 # Cloudflare-proxied requests are commonly capped at 100 MB on Free/Pro plans.
@@ -29,10 +32,13 @@ MAX_CONCURRENT_CONVERSIONS = int(os.environ.get("MAX_CONCURRENT_CONVERSIONS", "1
 MAX_DURATION_SECONDS = float(os.environ.get("MAX_DURATION_SECONDS", "30"))
 MAX_OUTPUT_FRAMES = int(os.environ.get("MAX_OUTPUT_FRAMES", "900"))
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
+ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 ALLOWED_MIME_PREFIXES = ("video/", "application/octet-stream")
 ALLOWED_ENCODERS = {"gifski", "libvips", "ffmpeg-high", "ffmpeg-med"}
-ALLOWED_WIDTHS = {"original", "800", "640", "480", "320"}
+ALLOWED_WIDTHS = {"original", "1000", "800", "640", "480", "320"}
 ALLOWED_LOOPS = {0, 1, 2}
+# Photo-series canvas: how the common frame size is derived.
+ALLOWED_CANVAS = {"first", "bbox", "1:1", "16:9", "9:16"}
 BASE_DIR = Path(__file__).parent
 OUTPUT_DIR = BASE_DIR / "output"
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -421,14 +427,14 @@ HTML = """<!DOCTYPE html>
 <body>
 <div class="app">
   <h1>GIF Maker</h1>
-  <p class="subtitle">Drop a video to make a GIF</p>
+  <p class="subtitle">Drop a video — or a series of photos — to make a GIF</p>
 
   <!-- Drop Zone -->
   <div class="drop-zone" id="dropZone">
-    <input type="file" id="fileInput" accept="video/mp4,video/*">
+    <input type="file" id="fileInput" accept="video/mp4,video/*,image/*" multiple>
     <span class="drop-icon" id="dropIcon"></span>
-    <div class="drop-label" id="dropLabel">Drop video here or click to browse</div>
-    <div class="drop-hint" id="dropHint">.mp4, .mov, .m4v, .webm supported · max __MAX_UPLOAD_MB__ MB</div>
+    <div class="drop-label" id="dropLabel">Drop a video or photos, or click to browse</div>
+    <div class="drop-hint" id="dropHint">Multiple photos → GIF frames · mp4 mov webm png jpg webp · max __MAX_UPLOAD_MB__ MB</div>
     <div class="file-info" id="fileInfo">
       <span class="file-name" id="fileName"></span>
       <span class="file-size" id="fileSize"></span>
@@ -438,7 +444,7 @@ HTML = """<!DOCTYPE html>
   <!-- Options -->
   <div class="options">
     <div class="option-group">
-      <label>FPS</label>
+      <label id="fpsLabel">FPS</label>
       <div class="slider-row">
         <input type="range" id="fps" min="5" max="30" step="1" value="15">
         <span class="slider-val" id="fpsVal">15</span>
@@ -449,10 +455,22 @@ HTML = """<!DOCTYPE html>
       <label>Width</label>
       <select id="width">
         <option value="original">Original</option>
+        <option value="1000">1000px</option>
         <option value="800">800px</option>
         <option value="640" selected>640px</option>
         <option value="480">480px</option>
         <option value="320">320px</option>
+      </select>
+    </div>
+
+    <div class="option-group" id="canvasGroup" style="display:none">
+      <label>Canvas</label>
+      <select id="canvas">
+        <option value="first" selected>First photo</option>
+        <option value="bbox">Largest bounding box</option>
+        <option value="1:1">Square (1:1)</option>
+        <option value="16:9">Widescreen (16:9)</option>
+        <option value="9:16">Vertical (9:16)</option>
       </select>
     </div>
 
@@ -469,9 +487,9 @@ HTML = """<!DOCTYPE html>
     <div class="option-group">
       <label>Encoder</label>
       <select id="encoder">
-        <option value="ffmpeg-high" selected>ffmpeg (2-pass palette)</option>
+        <option value="ffmpeg-high">ffmpeg (2-pass palette)</option>
         <option value="gifski">Gifski (best quality)</option>
-        <option value="libvips">libvips</option>
+        <option value="libvips" selected>libvips</option>
         <option value="ffmpeg-med">ffmpeg</option>
       </select>
     </div>
@@ -494,7 +512,7 @@ HTML = """<!DOCTYPE html>
     </div>
   </div>
 
-  <button class="convert-btn" id="convertBtn" disabled>Select a video first</button>
+  <button class="convert-btn" id="convertBtn" disabled>Select a video or photos</button>
 
   <!-- Progress -->
   <div class="progress-section" id="progressSection">
@@ -516,6 +534,7 @@ HTML = """<!DOCTYPE html>
 
 <script>
 let selectedFile = null;
+let selectedImages = null;  // Array of File when an image series is chosen
 let jobId = null;
 let pollTimer = null;
 
@@ -539,7 +558,26 @@ const resetBtn = document.getElementById('resetBtn');
 
 const fps = document.getElementById('fps');
 const fpsVal = document.getElementById('fpsVal');
-fps.addEventListener('input', () => fpsVal.textContent = fps.value);
+const fpsLabel = document.getElementById('fpsLabel');
+
+// The same slider drives FPS (video) and Seconds-per-photo (image series).
+function renderRateVal() {
+  fpsVal.textContent = selectedImages ? fps.value + 's' : fps.value;
+}
+function setRateControl(mode) {
+  const canvasGroup = document.getElementById('canvasGroup');
+  if (mode === 'images') {
+    fpsLabel.textContent = 'Seconds per photo';
+    fps.min = '0.25'; fps.max = '10'; fps.step = '0.25'; fps.value = '1';
+    canvasGroup.style.display = '';  // photo-only control
+  } else {
+    fpsLabel.textContent = 'FPS';
+    fps.min = '5'; fps.max = '30'; fps.step = '1'; fps.value = '15';
+    canvasGroup.style.display = 'none';
+  }
+  renderRateVal();
+}
+fps.addEventListener('input', renderRateVal);
 const MAX_UPLOAD_MB = __MAX_UPLOAD_MB__;
 const MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024;
 
@@ -549,12 +587,49 @@ dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-ove
 dropZone.addEventListener('drop', e => {
   e.preventDefault();
   dropZone.classList.remove('drag-over');
-  const file = e.dataTransfer.files[0];
-  if (file) setFile(file);
+  if (e.dataTransfer.files.length) handleFiles(e.dataTransfer.files);
 });
 fileInput.addEventListener('change', () => {
-  if (fileInput.files[0]) setFile(fileInput.files[0]);
+  if (fileInput.files.length) handleFiles(fileInput.files);
 });
+
+// Route a FileList: a single video → video mode; one or more images → series.
+function handleFiles(fileList) {
+  const files = Array.from(fileList);  // preserve drop/selection order
+  const allImages = files.every(f => f.type.startsWith('image/'));
+  if (files.length > 1 || (allImages && files.length >= 1)) {
+    if (!allImages) {
+      clearSelection();
+      showError('Mixed selection. Drop one video, or only images.');
+      return;
+    }
+    setImages(files);
+  } else {
+    setFile(files[0]);
+  }
+}
+
+function setImages(files) {
+  const total = files.reduce((sum, f) => sum + f.size, 0);
+  if (total > MAX_UPLOAD_BYTES) {
+    clearSelection();
+    showError(`Images too large. Max upload is ${MAX_UPLOAD_MB} MB total.`);
+    return;
+  }
+  selectedFile = null;
+  selectedImages = files;
+  setRateControl('images');
+  dropZone.classList.add('has-file');
+  dropIcon.textContent = '';
+  dropLabel.style.display = 'none';
+  dropHint.style.display = 'none';
+  fileInfo.classList.add('visible');
+  fileName.textContent = `${files.length} images`;
+  fileSize.textContent = formatBytes(total);
+  convertBtn.disabled = false;
+  convertBtn.textContent = 'Convert to GIF →';
+  resultSection.classList.remove('visible');
+}
 
 function setFile(file) {
   if (file.size > MAX_UPLOAD_BYTES) {
@@ -563,7 +638,9 @@ function setFile(file) {
     fileInput.value = '';
     return;
   }
+  selectedImages = null;
   selectedFile = file;
+  setRateControl('video');
   dropZone.classList.add('has-file');
   dropIcon.textContent = '';
   dropLabel.style.display = 'none';
@@ -578,6 +655,8 @@ function setFile(file) {
 
 function clearSelection() {
   selectedFile = null;
+  selectedImages = null;
+  setRateControl('video');
   fileInput.value = '';
   dropZone.classList.remove('has-file');
   dropIcon.textContent = '';
@@ -587,7 +666,7 @@ function clearSelection() {
   fileName.textContent = '';
   fileSize.textContent = '';
   convertBtn.disabled = true;
-  convertBtn.textContent = 'Select a video first';
+  convertBtn.textContent = 'Select a video or photos';
 }
 
 function formatBytes(b) {
@@ -597,18 +676,24 @@ function formatBytes(b) {
 
 // Convert
 convertBtn.addEventListener('click', async () => {
-  if (!selectedFile) return;
+  if (!selectedFile && !selectedImages) return;
 
   convertBtn.disabled = true;
   convertBtn.textContent = 'Converting…';
   progressSection.classList.add('visible');
-  progressLabel.textContent = 'Uploading video…';
+  progressLabel.textContent = selectedImages ? 'Uploading images…' : 'Uploading video…';
   progressBar.classList.add('indeterminate');
   resultSection.classList.remove('visible');
 
   const formData = new FormData();
-  formData.append('video', selectedFile);
-  formData.append('fps', fps.value);
+  if (selectedImages) {
+    selectedImages.forEach(f => formData.append('images', f));  // order preserved
+    formData.append('seconds_per_photo', fps.value);  // slider is seconds/photo here
+    formData.append('canvas', document.getElementById('canvas').value);
+  } else {
+    formData.append('video', selectedFile);
+    formData.append('fps', fps.value);
+  }
   formData.append('width', document.getElementById('width').value);
   formData.append('start', document.getElementById('startTime').value || '');
   formData.append('end', document.getElementById('endTime').value || '');
@@ -679,7 +764,7 @@ function showError(msg, canRetry = Boolean(selectedFile)) {
   err.textContent = msg;
   convertBtn.parentNode.insertBefore(err, convertBtn.nextSibling);
   convertBtn.disabled = !canRetry;
-  convertBtn.textContent = canRetry ? 'Try Again' : 'Select a video first';
+  convertBtn.textContent = canRetry ? 'Try Again' : 'Select a video or photos';
   setTimeout(() => err.remove(), 8000);
 }
 
@@ -848,11 +933,21 @@ def parse_multipart(body: bytes, content_type: str) -> dict:
 
         if name:
             if filename:
-                result[name] = {
+                entry = {
                     "filename": filename,
                     "content_type": part_content_type,
                     "data": content,
                 }
+                # Multiple files under the same field name (e.g. image series)
+                # accumulate into a list, preserving multipart part order.
+                if name in result:
+                    existing = result[name]
+                    if not isinstance(existing, list):
+                        existing = [existing]
+                    existing.append(entry)
+                    result[name] = existing
+                else:
+                    result[name] = entry
             else:
                 result[name] = content.decode("utf-8", errors="replace").strip()
 
@@ -862,6 +957,18 @@ def parse_multipart(body: bytes, content_type: str) -> dict:
 def _parse_int(value, default, minimum=None, maximum=None):
     try:
         parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if minimum is not None:
+        parsed = max(minimum, parsed)
+    if maximum is not None:
+        parsed = min(maximum, parsed)
+    return parsed
+
+
+def _parse_float(value, default, minimum=None, maximum=None):
+    try:
+        parsed = float(value)
     except (TypeError, ValueError):
         parsed = default
     if minimum is not None:
@@ -886,9 +993,65 @@ def _parse_time(value, label):
 
 def validate_params(params: dict) -> dict:
     video_data = params.get("video")
-    if not video_data or not isinstance(video_data, dict):
-        raise ValueError("No video file received")
+    images = params.get("images")
+    if images is not None and not isinstance(images, list):
+        images = [images]  # parser yields a dict for a single file
 
+    has_video = isinstance(video_data, dict)
+    has_images = bool(images)
+    if has_video == has_images:
+        raise ValueError("Upload either one video or a series of images")
+
+    # Options common to both modes
+    width_opt = (params.get("width", "640") or "640").strip()
+    if width_opt not in ALLOWED_WIDTHS:
+        raise ValueError("Unsupported width option")
+
+    loop = _parse_int(params.get("loop", "0"), default=0)
+    if loop not in ALLOWED_LOOPS:
+        raise ValueError("Unsupported loop option")
+
+    transparent = params.get("transparent", "0") == "1"
+
+    if has_images:
+        if len(images) > MAX_OUTPUT_FRAMES:
+            raise ValueError(f"Too many images. Max is {MAX_OUTPUT_FRAMES} frames.")
+        total_bytes = 0
+        for img in images:
+            if not isinstance(img, dict):
+                raise ValueError("Invalid image upload")
+            ext = Path(img.get("filename") or "").suffix.lower()
+            if ext not in ALLOWED_IMAGE_EXTENSIONS:
+                allowed = ", ".join(sorted(ALLOWED_IMAGE_EXTENSIONS))
+                raise ValueError(f"Unsupported image type. Use one of: {allowed}")
+            ctype = (img.get("content_type") or "").lower()
+            if not ctype.startswith("image/"):
+                raise ValueError("Unsupported image content type")
+            total_bytes += len(img.get("data", b""))
+        if total_bytes > MAX_UPLOAD_BYTES:
+            raise ValueError(f"Images too large. Max upload is {MAX_UPLOAD_MB} MB.")
+        # Photos: user picks seconds-per-photo; fps is its inverse (gifski accepts
+        # fractional fps, so e.g. 2s/photo -> 0.5 fps holds each frame for 2s).
+        seconds_per_photo = _parse_float(
+            params.get("seconds_per_photo", "1"), default=1.0, minimum=0.25, maximum=10.0
+        )
+        fps = round(1.0 / seconds_per_photo, 4)
+        canvas = (params.get("canvas", "first") or "first").strip()
+        if canvas not in ALLOWED_CANVAS:
+            raise ValueError("Unsupported canvas option")
+        # Image series are assembled with gifski (purpose-built for frame lists).
+        return {
+            "mode": "images",
+            "images": images,
+            "fps": fps,
+            "width": width_opt,
+            "canvas": canvas,
+            "encoder": "gifski",
+            "loop": loop,
+            "transparent": transparent,
+        }
+
+    # Video mode
     filename = video_data.get("filename") or ""
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -902,27 +1065,19 @@ def validate_params(params: dict) -> dict:
     if len(video_data.get("data", b"")) > MAX_UPLOAD_BYTES:
         raise ValueError(f"File too large. Max upload is {MAX_UPLOAD_MB} MB.")
 
-    fps = _parse_int(params.get("fps", "15"), default=15, minimum=1, maximum=30)
-    width_opt = (params.get("width", "640") or "640").strip()
-    if width_opt not in ALLOWED_WIDTHS:
-        raise ValueError("Unsupported width option")
-
-    encoder = (params.get("encoder", "ffmpeg-high") or "ffmpeg-high").strip()
+    encoder = (params.get("encoder", "libvips") or "libvips").strip()
     if encoder not in ALLOWED_ENCODERS:
         raise ValueError("Unsupported encoder option")
 
-    loop = _parse_int(params.get("loop", "0"), default=0)
-    if loop not in ALLOWED_LOOPS:
-        raise ValueError("Unsupported loop option")
+    fps = _parse_int(params.get("fps", "15"), default=15, minimum=1, maximum=30)
 
     start = _parse_time(params.get("start", ""), "Start")
     end = _parse_time(params.get("end", ""), "End")
     if start and end and float(end) <= float(start):
         raise ValueError("End time must be greater than start time")
 
-    transparent = params.get("transparent", "0") == "1"
-
     return {
+        "mode": "video",
         "video": video_data,
         "fps": fps,
         "width": width_opt,
@@ -967,6 +1122,36 @@ def probe_duration(input_path: str) -> float:
     return duration
 
 
+def _probe_image_size(path: str, label: str) -> tuple[int, int]:
+    """Return (width, height) of an image via ffprobe."""
+    r = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        w, h = r.stdout.strip().split("x")
+        return int(w), int(h)
+    except (ValueError, AttributeError):
+        raise RuntimeError(f"Could not read dimensions of image '{label}'")
+
+
+def _canvas_dims(canvas: str, sizes: list) -> tuple[int, int]:
+    """Common (width, height) for a photo series, from the chosen canvas mode.
+    `sizes` is a list of (w, h) in upload order (sizes[0] = first photo)."""
+    max_w = max(w for w, _ in sizes)
+    max_h = max(h for _, h in sizes)
+    if canvas == "bbox":
+        return max_w, max_h
+    if canvas in ("1:1", "16:9", "9:16"):
+        longest = max(max_w, max_h)
+        if canvas == "1:1":
+            return longest, longest
+        short = max(1, round(longest * 9 / 16))
+        return (longest, short) if canvas == "16:9" else (short, longest)
+    return sizes[0]  # "first" (default)
+
+
 def enforce_clip_limits(source_duration: float, start: str, end: str, fps: int):
     start_s = float(start) if start else 0.0
     end_s = float(end) if end else source_duration
@@ -983,6 +1168,44 @@ def enforce_clip_limits(source_duration: float, start: str, end: str, fps: int):
     return clip_duration, estimated_frames
 
 
+def _finalize_output(job_id, output_path, output_name, fps, encoder, transparent):
+    """Probe the finished GIF and publish the done status (shared by all modes)."""
+    gif_bytes = os.path.getsize(output_path)
+    size_str = f"{gif_bytes/1024:.0f} KB" if gif_bytes < 1024*1024 else f"{gif_bytes/1024/1024:.1f} MB"
+
+    probe = subprocess.run(
+        ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+         "-count_packets",
+         "-show_entries", "stream=width,height,nb_read_packets",
+         "-of", "csv=p=0", output_path],
+        capture_output=True, text=True
+    )
+    w, h, frames_count = "?", "?", "?"
+    parts_out = probe.stdout.strip().split(",")
+    if len(parts_out) >= 2:
+        w, h = parts_out[0], parts_out[1]
+    if len(parts_out) >= 3 and parts_out[2].strip():
+        frames_count = parts_out[2].strip()
+
+    with jobs_lock:
+        if job_id not in jobs:  # job evicted/expired mid-run — discard output
+            if os.path.exists(output_path):
+                os.unlink(output_path)
+            return
+        jobs[job_id] = {
+            "status": "done",
+            "url": f"/output/{output_name}",
+            "filename": output_name,
+            "size": size_str,
+            "width": w,
+            "height": h,
+            "frames": frames_count,
+            "fps": fps,
+            "encoder": encoder,
+            "transparent": transparent,
+        }
+
+
 def run_conversion(job_id: str, params: dict, release_slot: bool = False):
     import tempfile
     import shutil
@@ -996,6 +1219,73 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
     frames_dir = None
     trimmed_path = None
     try:
+        # ── Image series → GIF ────────────────────────────────────────────────
+        if params.get("mode") == "images":
+            fps = params["fps"]
+            width_opt = params["width"]
+            transparent = params["transparent"]
+            _, gifski_repeat = loop_values(params["loop"])
+            output_name = f"{job_id}.gif"
+            output_path = str(OUTPUT_DIR / output_name)
+
+            update("Preparing images…")
+            frames_dir = tempfile.mkdtemp()  # cleaned by finally (rmtree)
+
+            # Pass 1: write each source and probe its size — needed to size the
+            # canvas before encoding (gifski rejects mismatched frame sizes).
+            srcs = []  # (src_path, filename)
+            sizes = []
+            for i, img in enumerate(params["images"]):
+                src_suffix = Path(img["filename"]).suffix.lower() or ".png"
+                src_path = os.path.join(frames_dir, f"src{i:05d}{src_suffix}")
+                with open(src_path, "wb") as sf:
+                    sf.write(img["data"])
+                sizes.append(_probe_image_size(src_path, img["filename"]))
+                srcs.append((src_path, img["filename"]))
+
+            tw, th = _canvas_dims(params["canvas"], sizes)
+            # Crop-to-fill: scale to cover the canvas, then center-crop overflow,
+            # so every frame is exactly tw×th. format=rgba keeps source alpha.
+            fmt = "format=rgba," if transparent else ""
+            vf = (f"{fmt}scale={tw}:{th}:force_original_aspect_ratio=increase:"
+                  f"flags=lanczos,crop={tw}:{th}")
+
+            # Pass 2: transcode each source to a uniform PNG frame (gifski's
+            # multi-image input is PNG-only; sequential names preserve order).
+            frame_paths = []
+            for i, (src_path, fname) in enumerate(srcs):
+                frame_path = os.path.join(frames_dir, f"frame{i:05d}.png")
+                r = subprocess.run(
+                    ["ffmpeg", "-y", "-i", src_path, "-vf", vf, "-frames:v", "1", frame_path],
+                    capture_output=True, text=True, timeout=60
+                )
+                os.unlink(src_path)
+                if r.returncode != 0:
+                    raise RuntimeError(
+                        f"Could not read image '{fname}':\n{r.stderr[-400:]}"
+                    )
+                frame_paths.append(frame_path)
+
+            update("Encoding with Gifski…")
+            gifski_cmd = [
+                "gifski",
+                "--no-sort",  # preserve given (drop) order, don't re-sort
+                "--fps", str(fps),
+                "--quality", "90",
+                "--repeat", str(gifski_repeat),
+                "-o", output_path,
+            ]
+            if width_opt != "original":
+                gifski_cmd += ["-W", width_opt]
+            gifski_cmd += frame_paths
+            result = subprocess.run(gifski_cmd, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                raise RuntimeError(f"Gifski failed:\n{result.stderr[-800:]}")
+
+            _finalize_output(job_id, output_path, output_name, fps, "gifski",
+                             params["transparent"])
+            return
+
         update("Saving uploaded video…")
 
         video_data = params.get("video")
@@ -1158,40 +1448,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
                 raise RuntimeError(f"GIF conversion failed:\n{result.stderr[-800:]}")
 
         # ── Gather output info ────────────────────────────────────────────────
-        gif_bytes = os.path.getsize(output_path)
-        size_str = f"{gif_bytes/1024:.0f} KB" if gif_bytes < 1024*1024 else f"{gif_bytes/1024/1024:.1f} MB"
-
-        probe = subprocess.run(
-            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
-             "-count_packets",
-             "-show_entries", "stream=width,height,nb_read_packets",
-             "-of", "csv=p=0", output_path],
-            capture_output=True, text=True
-        )
-        w, h, frames_count = "?", "?", "?"
-        parts_out = probe.stdout.strip().split(",")
-        if len(parts_out) >= 2:
-            w, h = parts_out[0], parts_out[1]
-        if len(parts_out) >= 3 and parts_out[2].strip():
-            frames_count = parts_out[2].strip()
-
-        with jobs_lock:
-            if job_id not in jobs:
-                if os.path.exists(output_path):
-                    os.unlink(output_path)
-                return
-            jobs[job_id] = {
-                "status": "done",
-                "url": f"/output/{output_name}",
-                "filename": output_name,
-                "size": size_str,
-                "width": w,
-                "height": h,
-                "frames": frames_count,
-                "fps": fps,
-                "encoder": encoder,
-                "transparent": transparent,
-            }
+        _finalize_output(job_id, output_path, output_name, fps, encoder, transparent)
 
     except Exception as e:
         with jobs_lock:
