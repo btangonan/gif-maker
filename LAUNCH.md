@@ -21,7 +21,7 @@ Default launch settings:
 PORT=7878
 MAX_UPLOAD_MB=95
 MAX_CONCURRENT_CONVERSIONS=1
-MAX_DURATION_SECONDS=30
+MAX_DURATION_SECONDS=60
 MAX_OUTPUT_FRAMES=900
 ```
 
@@ -82,7 +82,7 @@ Example plist:
     <key>MAX_CONCURRENT_CONVERSIONS</key>
     <string>1</string>
     <key>MAX_DURATION_SECONDS</key>
-    <string>30</string>
+    <string>60</string>
     <key>MAX_OUTPUT_FRAMES</key>
     <string>900</string>
   </dict>
