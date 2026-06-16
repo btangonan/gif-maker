@@ -10,6 +10,7 @@ import socketserver
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -23,13 +24,15 @@ os.environ["PATH"] = f"{TOOL_PATH_PREFIX}:{os.environ.get('PATH', os.defpath)}"
 
 PORT = int(os.environ.get("PORT", 7878))
 HOST = os.environ.get("HOST", "127.0.0.1")
-# Cloudflare-proxied requests are commonly capped at 100 MB on Free/Pro plans.
-# Keep the app default just below that; override with MAX_UPLOAD_MB for other hosts.
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "95"))
+# Default sized for local use and photo batches (held in memory during parsing,
+# so 500 MB is the practical ceiling). Override with MAX_UPLOAD_MB per host.
+# NOTE: the public gif.tangonan.dev tunnel goes through Cloudflare, which caps
+# requests at ~100 MB on Free/Pro plans — larger batches must use the local origin.
+MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "500"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_JOBS = 500
 MAX_CONCURRENT_CONVERSIONS = int(os.environ.get("MAX_CONCURRENT_CONVERSIONS", "1"))
-MAX_DURATION_SECONDS = float(os.environ.get("MAX_DURATION_SECONDS", "30"))
+MAX_DURATION_SECONDS = float(os.environ.get("MAX_DURATION_SECONDS", "60"))
 MAX_OUTPUT_FRAMES = int(os.environ.get("MAX_OUTPUT_FRAMES", "900"))
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -37,6 +40,7 @@ ALLOWED_MIME_PREFIXES = ("video/", "application/octet-stream")
 ALLOWED_ENCODERS = {"gifski", "libvips", "ffmpeg-high", "ffmpeg-med"}
 ALLOWED_WIDTHS = {"original", "1000", "800", "640", "480", "320"}
 ALLOWED_LOOPS = {0, 1, 2}
+ALLOWED_SPEED_FACTORS = {1.0, 2.0, 3.0, 4.0}
 # Photo-series canvas: how the common frame size is derived.
 ALLOWED_CANVAS = {"first", "bbox", "1:1", "16:9", "9:16"}
 BASE_DIR = Path(__file__).parent
@@ -446,7 +450,7 @@ HTML = """<!DOCTYPE html>
     <div class="option-group">
       <label id="fpsLabel">FPS</label>
       <div class="slider-row">
-        <input type="range" id="fps" min="5" max="30" step="1" value="15">
+        <input type="range" id="fps" min="1" max="30" step="1" value="15">
         <span class="slider-val" id="fpsVal">15</span>
       </div>
     </div>
@@ -500,6 +504,16 @@ HTML = """<!DOCTYPE html>
         <option value="0" selected>Forever</option>
         <option value="1">Play once</option>
         <option value="2">Twice</option>
+      </select>
+    </div>
+
+    <div class="option-group">
+      <label>Speed</label>
+      <select id="speed">
+        <option value="1" selected>Normal</option>
+        <option value="2">2x slower</option>
+        <option value="3">3x slower</option>
+        <option value="4">4x slower</option>
       </select>
     </div>
 
@@ -572,7 +586,7 @@ function setRateControl(mode) {
     canvasGroup.style.display = '';  // photo-only control
   } else {
     fpsLabel.textContent = 'FPS';
-    fps.min = '5'; fps.max = '30'; fps.step = '1'; fps.value = '15';
+    fps.min = '1'; fps.max = '30'; fps.step = '1'; fps.value = '15';
     canvasGroup.style.display = 'none';
   }
   renderRateVal();
@@ -699,6 +713,7 @@ convertBtn.addEventListener('click', async () => {
   formData.append('end', document.getElementById('endTime').value || '');
   formData.append('encoder', document.getElementById('encoder').value);
   formData.append('loop', document.getElementById('loop').value);
+  formData.append('speed', document.getElementById('speed').value);
   formData.append('transparent', document.getElementById('transparent').value);
 
   try {
@@ -748,7 +763,8 @@ function showResult(data) {
     resultGif.classList.remove('checkerboard');
   }
   const encoderLabel = {'gifski':'Gifski','ffmpeg-high':'ffmpeg (2-pass)','libvips':'libvips','ffmpeg-med':'ffmpeg'}[data.encoder] || data.encoder;
-  resultMeta.textContent = `${data.width}×${data.height} · ${data.size} · ${data.frames} frames · ${data.fps} fps · ${encoderLabel}`;
+  const speedLabel = data.speed_factor && data.speed_factor !== 1 ? ` · ${data.speed_factor}x slower` : '';
+  resultMeta.textContent = `${data.width}×${data.height} · ${data.size} · ${data.frames} frames · ${data.fps} fps${speedLabel} · ${encoderLabel}`;
   downloadBtn.href = data.url;
   downloadBtn.download = data.filename;
   convertBtn.disabled = false;
@@ -922,12 +938,16 @@ def parse_multipart(body: bytes, content_type: str) -> dict:
         part_content_type = ""
         for line in headers_str.splitlines():
             if "Content-Disposition" in line:
-                for seg in line.split(";"):
-                    seg = seg.strip()
-                    if seg.startswith("name="):
-                        name = seg[5:].strip('"')
-                    elif seg.startswith("filename="):
-                        filename = seg[9:].strip('"')
+                # Extract quoted values directly. Splitting on ";" corrupts any
+                # filename that itself contains a semicolon (e.g.
+                # "add_grain;_preserve.png" -> "add_grain"), dropping its
+                # extension and failing later type validation.
+                name_match = re.search(r'(?:^|;\s*)name="((?:[^"\\]|\\.)*)"', line)
+                if name_match:
+                    name = name_match.group(1)
+                fn_match = re.search(r'(?:^|;\s*)filename="((?:[^"\\]|\\.)*)"', line)
+                if fn_match:
+                    filename = fn_match.group(1)
             elif line.lower().startswith("content-type:"):
                 part_content_type = line.split(":", 1)[1].strip().lower()
 
@@ -978,6 +998,13 @@ def _parse_float(value, default, minimum=None, maximum=None):
     return parsed
 
 
+def _parse_speed_factor(value) -> float:
+    speed_factor = _parse_float(value, default=1.0)
+    if speed_factor not in ALLOWED_SPEED_FACTORS:
+        raise ValueError("Unsupported speed option")
+    return speed_factor
+
+
 def _parse_time(value, label):
     value = (value or "").strip()
     if not value:
@@ -1012,6 +1039,7 @@ def validate_params(params: dict) -> dict:
         raise ValueError("Unsupported loop option")
 
     transparent = params.get("transparent", "0") == "1"
+    speed_factor = _parse_speed_factor(params.get("speed", "1"))
 
     if has_images:
         if len(images) > MAX_OUTPUT_FRAMES:
@@ -1035,7 +1063,7 @@ def validate_params(params: dict) -> dict:
         seconds_per_photo = _parse_float(
             params.get("seconds_per_photo", "1"), default=1.0, minimum=0.25, maximum=10.0
         )
-        fps = round(1.0 / seconds_per_photo, 4)
+        fps = round(1.0 / (seconds_per_photo * speed_factor), 4)
         canvas = (params.get("canvas", "first") or "first").strip()
         if canvas not in ALLOWED_CANVAS:
             raise ValueError("Unsupported canvas option")
@@ -1048,6 +1076,7 @@ def validate_params(params: dict) -> dict:
             "canvas": canvas,
             "encoder": "gifski",
             "loop": loop,
+            "speed_factor": speed_factor,
             "transparent": transparent,
         }
 
@@ -1085,6 +1114,7 @@ def validate_params(params: dict) -> dict:
         "end": end,
         "encoder": encoder,
         "loop": loop,
+        "speed_factor": speed_factor,
         "transparent": transparent,
     }
 
@@ -1162,13 +1192,34 @@ def enforce_clip_limits(source_duration: float, start: str, end: str, fps: int):
         raise ValueError("Selected clip has no duration")
     if clip_duration > MAX_DURATION_SECONDS:
         raise ValueError(f"Clip is too long. Max duration is {MAX_DURATION_SECONDS:g} seconds.")
-    estimated_frames = math.ceil(clip_duration * fps)
+    estimated_frames = math.ceil((clip_duration * fps) - 1e-9)
     if estimated_frames > MAX_OUTPUT_FRAMES:
         raise ValueError(f"Clip has too many frames. Max output is {MAX_OUTPUT_FRAMES} frames.")
     return clip_duration, estimated_frames
 
 
-def _finalize_output(job_id, output_path, output_name, fps, encoder, transparent):
+def _video_filter(fps, width_opt, speed_factor=1.0):
+    """Build the ffmpeg video filter chain for sampled GIF frames."""
+    if width_opt == "original":
+        scale = "scale=iw:ih"
+    else:
+        scale = f"scale={width_opt}:-2:flags=lanczos"
+    filters = [f"fps={fps}"]
+    if speed_factor != 1.0:
+        filters.append(f"setpts={speed_factor}*PTS")
+    filters.append(scale)
+    return ",".join(filters)
+
+
+def _playback_fps(fps, speed_factor):
+    return round(fps / speed_factor, 4)
+
+
+def _frame_delay_ms(fps, speed_factor):
+    return max(10, round(1000 * speed_factor / fps))
+
+
+def _finalize_output(job_id, output_path, output_name, fps, encoder, transparent, speed_factor=1.0):
     """Probe the finished GIF and publish the done status (shared by all modes)."""
     gif_bytes = os.path.getsize(output_path)
     size_str = f"{gif_bytes/1024:.0f} KB" if gif_bytes < 1024*1024 else f"{gif_bytes/1024/1024:.1f} MB"
@@ -1202,6 +1253,7 @@ def _finalize_output(job_id, output_path, output_name, fps, encoder, transparent
             "frames": frames_count,
             "fps": fps,
             "encoder": encoder,
+            "speed_factor": speed_factor,
             "transparent": transparent,
         }
 
@@ -1283,7 +1335,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
                 raise RuntimeError(f"Gifski failed:\n{result.stderr[-800:]}")
 
             _finalize_output(job_id, output_path, output_name, fps, "gifski",
-                             params["transparent"])
+                             params["transparent"], params["speed_factor"])
             return
 
         update("Saving uploaded video…")
@@ -1305,6 +1357,8 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
         encoder = params["encoder"]
         loop = params["loop"]
         transparent = params["transparent"]
+        speed_factor = params["speed_factor"]
+        playback_fps = _playback_fps(fps, speed_factor)
         ffmpeg_loop, gifski_repeat = loop_values(loop)
         source_duration = probe_duration(input_path)
         clip_duration, estimated_frames = enforce_clip_limits(source_duration, start, end, fps)
@@ -1316,12 +1370,8 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
         output_name = f"{job_id}.gif"
         output_path = str(OUTPUT_DIR / output_name)
 
-        # ffmpeg scale filter
-        if width_opt == "original":
-            scale = "scale=iw:ih"
-        else:
-            scale = f"scale={width_opt}:-2:flags=lanczos"
-        vf_base = f"fps={fps},{scale}"
+        vf_sample = _video_filter(fps, width_opt)
+        vf_playback = _video_filter(fps, width_opt, speed_factor)
 
         # ffmpeg time-range args
         time_args = []
@@ -1337,41 +1387,34 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
 
         # ── Gifski ────────────────────────────────────────────────────────────
         if encoder == "gifski":
+            import glob as globmod
+            frames_dir = tempfile.mkdtemp()
+            update("Extracting frames…")
+            frame_pattern = os.path.join(frames_dir, "frame%05d.png")
+            extract_cmd = [
+                "ffmpeg", "-y", *time_args,
+                "-i", input_path,
+                "-vf", vf_sample,
+                frame_pattern,
+            ]
+            r = subprocess.run(extract_cmd, capture_output=True, text=True, timeout=180)
+            if r.returncode != 0:
+                raise RuntimeError(f"Frame extraction failed:\n{r.stderr[-800:]}")
+            frames = sorted(globmod.glob(os.path.join(frames_dir, "frame*.png")))
+            if not frames:
+                raise RuntimeError("No frames extracted from video")
+
             update("Encoding with Gifski…")
             gifski_cmd = [
                 "gifski",
-                "--fps", str(fps),
+                "--no-sort",
+                "--fps", str(playback_fps),
                 "--quality", "90",
                 "--repeat", str(gifski_repeat),
                 "-o", output_path,
             ]
-            if width_opt != "original":
-                gifski_cmd += ["-W", width_opt]
-            # gifski handles trim via ffmpeg pre-pass if time args needed
-            if time_args:
-                update("Trimming clip…")
-                with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
-                    trimmed_path = tf.name
-                trim_cmd = [
-                    "ffmpeg", "-y", *time_args,
-                    "-i", input_path,
-                    "-c", "copy", trimmed_path
-                ]
-                r = subprocess.run(trim_cmd, capture_output=True, text=True, timeout=120)
-                if r.returncode != 0:
-                    # fallback: re-encode trim
-                    trim_cmd = ["ffmpeg", "-y", *time_args, "-i", input_path, trimmed_path]
-                    r = subprocess.run(trim_cmd, capture_output=True, text=True, timeout=120)
-                if r.returncode != 0:
-                    raise RuntimeError(f"Trim failed:\n{r.stderr[-800:]}")
-                gifski_cmd.append(trimmed_path)
-                update("Encoding with Gifski…")
-                result = subprocess.run(gifski_cmd, capture_output=True, text=True, timeout=300)
-                os.unlink(trimmed_path)
-                trimmed_path = None
-            else:
-                gifski_cmd.append(input_path)
-                result = subprocess.run(gifski_cmd, capture_output=True, text=True, timeout=300)
+            gifski_cmd += frames
+            result = subprocess.run(gifski_cmd, capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
                 raise RuntimeError(f"Gifski failed:\n{result.stderr[-800:]}")
 
@@ -1385,7 +1428,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
             extract_cmd = [
                 "ffmpeg", "-y", *time_args,
                 "-i", input_path,
-                "-vf", vf_base,
+                "-vf", vf_sample,
                 *pix_fmt_args,
                 frame_pattern
             ]
@@ -1406,7 +1449,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
             import pyvips
             images = [pyvips.Image.new_from_file(f, access="sequential") for f in frames]
             joined = pyvips.Image.arrayjoin(images, across=1)
-            delay_ms = max(10, round(1000 / fps))
+            delay_ms = _frame_delay_ms(fps, speed_factor)
             joined.set_type(pyvips.GValue.array_int_type, "delay", [delay_ms] * len(images))
             joined.set_type(pyvips.GValue.gint_type, "page-height", images[0].height)
             joined.set_type(pyvips.GValue.gint_type, "loop", ffmpeg_loop)
@@ -1419,7 +1462,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
             reserve = "1" if transparent else "0"
             r = subprocess.run(
                 ["ffmpeg", "-y", *time_args, "-i", input_path,
-                 "-vf", f"{vf_base},palettegen=stats_mode=diff:reserve_transparent={reserve}", palette_path],
+                 "-vf", f"{vf_sample},palettegen=stats_mode=diff:reserve_transparent={reserve}", palette_path],
                 capture_output=True, text=True, timeout=120
             )
             if r.returncode != 0:
@@ -1429,7 +1472,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
             alpha_opt = ":alpha_threshold=128" if transparent else ""
             result = subprocess.run(
                 ["ffmpeg", "-y", *time_args, "-i", input_path, "-i", palette_path,
-                 "-lavfi", f"{vf_base} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle{alpha_opt}",
+                 "-lavfi", f"{vf_playback} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle{alpha_opt}",
                  "-loop", str(ffmpeg_loop), output_path],
                 capture_output=True, text=True, timeout=300
             )
@@ -1441,14 +1484,14 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
             update("Rendering GIF…")
             result = subprocess.run(
                 ["ffmpeg", "-y", *time_args, "-i", input_path,
-                 "-vf", vf_base, "-loop", str(ffmpeg_loop), output_path],
+                 "-vf", vf_playback, "-loop", str(ffmpeg_loop), output_path],
                 capture_output=True, text=True, timeout=300
             )
             if result.returncode != 0:
                 raise RuntimeError(f"GIF conversion failed:\n{result.stderr[-800:]}")
 
         # ── Gather output info ────────────────────────────────────────────────
-        _finalize_output(job_id, output_path, output_name, fps, encoder, transparent)
+        _finalize_output(job_id, output_path, output_name, playback_fps, encoder, transparent, speed_factor)
 
     except Exception as e:
         with jobs_lock:
