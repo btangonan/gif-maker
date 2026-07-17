@@ -248,21 +248,21 @@ class CanvasDimsTests(unittest.TestCase):
 
 
 class ResourceLimitTests(unittest.TestCase):
-    def test_enforce_clip_limits_allows_sixty_second_clip(self):
+    def test_enforce_clip_limits_allows_ninety_second_clip(self):
         clip_duration, estimated_frames = app.enforce_clip_limits(
-            source_duration=60, start="", end="", fps=15
+            source_duration=90, start="", end="", fps=15
         )
 
-        self.assertEqual(clip_duration, 60)
-        self.assertEqual(estimated_frames, 900)
+        self.assertEqual(clip_duration, 90)
+        self.assertEqual(estimated_frames, 1350)
 
     def test_enforce_clip_limits_rejects_long_clip(self):
         with self.assertRaisesRegex(ValueError, "Clip is too long"):
-            app.enforce_clip_limits(source_duration=61, start="", end="", fps=15)
+            app.enforce_clip_limits(source_duration=91, start="", end="", fps=15)
 
     def test_enforce_clip_limits_rejects_too_many_frames(self):
         with self.assertRaisesRegex(ValueError, "too many frames"):
-            app.enforce_clip_limits(source_duration=30, start="", end="", fps=31)
+            app.enforce_clip_limits(source_duration=46, start="", end="", fps=30)
 
     def test_conversion_slot_is_nonblocking(self):
         acquired = app.conversion_slots.acquire(blocking=False)

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>dev.tangonan.gif-maker-tunnel.system</string>
+  <key>UserName</key>
+  <string>bradleytangonan</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/cloudflared</string>
+    <string>tunnel</string>
+    <string>--config</string>
+    <string>/Users/bradleytangonan/.cloudflared/gif-maker.yml</string>
+    <string>run</string>
+    <string>gif-maker</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/bradleytangonan/Library/Logs/gif-maker-tunnel.system.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/bradleytangonan/Library/Logs/gif-maker-tunnel.system.err.log</string>
+</dict>
+</plist>

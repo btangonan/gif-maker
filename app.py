@@ -32,8 +32,8 @@ MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "500"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 MAX_JOBS = 500
 MAX_CONCURRENT_CONVERSIONS = int(os.environ.get("MAX_CONCURRENT_CONVERSIONS", "1"))
-MAX_DURATION_SECONDS = float(os.environ.get("MAX_DURATION_SECONDS", "60"))
-MAX_OUTPUT_FRAMES = int(os.environ.get("MAX_OUTPUT_FRAMES", "900"))
+MAX_DURATION_SECONDS = float(os.environ.get("MAX_DURATION_SECONDS", "90"))
+MAX_OUTPUT_FRAMES = int(os.environ.get("MAX_OUTPUT_FRAMES", "1350"))
 ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 ALLOWED_MIME_PREFIXES = ("video/", "application/octet-stream")
@@ -696,7 +696,8 @@ convertBtn.addEventListener('click', async () => {
   convertBtn.textContent = 'Converting…';
   progressSection.classList.add('visible');
   progressLabel.textContent = selectedImages ? 'Uploading images…' : 'Uploading video…';
-  progressBar.classList.add('indeterminate');
+  progressBar.classList.remove('indeterminate');
+  progressBar.style.width = '0%';
   resultSection.classList.remove('visible');
 
   const formData = new FormData();
@@ -717,10 +718,42 @@ convertBtn.addEventListener('click', async () => {
   formData.append('transparent', document.getElementById('transparent').value);
 
   try {
-    const res = await fetch('/convert', { method: 'POST', body: formData });
-    const data = await res.json();
+    // Upload via XHR (not fetch) so we get real upload-progress events and a
+    // hard timeout — a stalled upload becomes visible and retryable instead of
+    // an infinite indeterminate spinner.
+    const uploadRes = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', '/convert');
+      xhr.timeout = 15 * 60 * 1000;  // 15 min ceiling for a large upload
+      xhr.upload.onprogress = (e) => {
+        if (!e.lengthComputable) return;
+        const pct = Math.round((e.loaded / e.total) * 100);
+        progressBar.style.width = pct + '%';
+        progressLabel.textContent = pct < 100
+          ? (selectedImages ? 'Uploading images… ' : 'Uploading video… ') + pct + '%'
+          : 'Processing upload…';
+      };
+      xhr.onload = () => resolve({ status: xhr.status, body: xhr.responseText });
+      xhr.onerror = () => reject(new Error('Upload failed — check your connection and try again.'));
+      xhr.ontimeout = () => reject(new Error('Upload timed out. Try a smaller clip or check your connection.'));
+      xhr.send(formData);
+    });
+
+    if (uploadRes.status !== 200) {
+      const friendly = {
+        413: `File too large. Max upload is ${MAX_UPLOAD_MB} MB.`,
+        503: 'Server is busy with another conversion. Try again in a minute.',
+        502: 'Server is unreachable right now. Try again shortly.',
+        504: 'The server took too long to respond. Try again.',
+      };
+      let serverMsg;
+      try { serverMsg = JSON.parse(uploadRes.body).error; } catch (_) {}
+      throw new Error(serverMsg || friendly[uploadRes.status] || `Server error (${uploadRes.status}). Please try again.`);
+    }
+    const data = JSON.parse(uploadRes.body);
     if (data.error) throw new Error(data.error);
     jobId = data.job_id;
+    progressBar.classList.add('indeterminate');
     progressLabel.textContent = 'Converting… (this may take a moment)';
     pollJob();
   } catch(e) {
@@ -729,10 +762,13 @@ convertBtn.addEventListener('click', async () => {
 });
 
 function pollJob() {
+  let pollFails = 0;
   pollTimer = setInterval(async () => {
     try {
       const res = await fetch('/status/' + jobId);
+      if (!res.ok) throw new Error('status ' + res.status);
       const data = await res.json();
+      pollFails = 0;
 
       if (data.status === 'done') {
         clearInterval(pollTimer);
@@ -747,8 +783,11 @@ function pollJob() {
         if (data.step) progressLabel.textContent = data.step;
       }
     } catch(e) {
-      clearInterval(pollTimer);
-      showError('Network error while checking conversion status. Please try again.');
+      // Tolerate transient blips — the conversion keeps running server-side.
+      if (++pollFails >= 5) {
+        clearInterval(pollTimer);
+        showError('Lost contact with the server while converting. Please try again.');
+      }
     }
   }, 800);
 }
@@ -771,7 +810,7 @@ function showResult(data) {
   convertBtn.textContent = 'Convert Again';
 }
 
-function showError(msg, canRetry = Boolean(selectedFile)) {
+function showError(msg, canRetry = Boolean(selectedFile || selectedImages)) {
   progressSection.classList.remove('visible');
   // Clear any existing error before inserting a new one
   document.querySelectorAll('.error-msg').forEach(el => el.remove());
@@ -797,6 +836,10 @@ resetBtn.addEventListener('click', () => {
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
+    # Drop stalled connections instead of parking a handler thread (and up to
+    # MAX_UPLOAD_BYTES of buffered body) forever on a half-open socket. This is a
+    # per-recv inactivity timeout, so a slow-but-progressing upload is unaffected.
+    timeout = 120
 
     def log_message(self, format, *args):
         pass  # suppress request logs
@@ -809,7 +852,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, "text/html", html.encode())
 
         elif path == "/healthz":
-            self._json(200, {"ok": True})
+            # Report liveness plus whether the single conversion slot is occupied,
+            # so an external watchdog can catch an alive-but-wedged process that
+            # KeepAlive (which only restarts dead processes) would miss.
+            free = conversion_slots.acquire(blocking=False)
+            if free:
+                conversion_slots.release()
+            with jobs_lock:
+                njobs = len(jobs)
+            self._json(200, {"ok": True, "busy": not free, "jobs": njobs})
 
         elif path == "/favicon.svg":
             svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="6" fill="#0a0a0a"/><text x="16" y="26" font-family="\'Inter\', system-ui, -apple-system, sans-serif" font-size="30" font-weight="900" fill="#c8ff00" text-anchor="middle">G</text></svg>'
@@ -865,26 +916,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._json(503, {"error": "Another conversion is running. Please try again shortly."})
                 return
 
-            job_id = str(uuid.uuid4())[:8]
-            with jobs_lock:
-                if len(jobs) >= MAX_JOBS:
-                    evictable = [k for k, v in list(jobs.items())
-                                 if isinstance(v, dict) and v.get("status") in ("done", "error")]
-                    for k in evictable[:50]:
-                        gif = OUTPUT_DIR / f"{k}.gif"
-                        gif.unlink(missing_ok=True)
-                        jobs.pop(k, None)
-                if len(jobs) >= MAX_JOBS:
-                    self._json(503, {"error": "Server is busy. Please try again shortly."})
+            # Own the slot until the worker thread takes over. Any early exit here
+            # (busy-evict 503, response-write failure, client abort) must release it,
+            # or a dropped connection permanently wedges the single conversion slot.
+            slot_owned = True
+            try:
+                job_id = str(uuid.uuid4())[:8]
+                with jobs_lock:
+                    if len(jobs) >= MAX_JOBS:
+                        evictable = [k for k, v in list(jobs.items())
+                                     if isinstance(v, dict) and v.get("status") in ("done", "error")]
+                        for k in evictable[:50]:
+                            gif = OUTPUT_DIR / f"{k}.gif"
+                            gif.unlink(missing_ok=True)
+                            jobs.pop(k, None)
+                    if len(jobs) >= MAX_JOBS:
+                        self._json(503, {"error": "Server is busy. Please try again shortly."})
+                        return  # finally releases the slot
+                    jobs[job_id] = {"status": "queued", "step": "Queued…"}
+
+                # Start the worker, which now owns the release via its finally block,
+                # then acknowledge. A broken pipe on the ack no longer leaks the slot.
+                t = threading.Thread(target=run_conversion, args=(job_id, params, True), daemon=True)
+                t.start()
+                slot_owned = False
+                try:
+                    self._json(200, {"job_id": job_id})
+                except OSError:
+                    pass  # client hung up after the job started; conversion continues
+            finally:
+                if slot_owned:
                     conversion_slots.release()
-                    return
-                jobs[job_id] = {"status": "queued", "step": "Queued…"}
-
-            self._json(200, {"job_id": job_id})
-
-            # Run conversion in background thread
-            t = threading.Thread(target=run_conversion, args=(job_id, params, True), daemon=True)
-            t.start()
 
         else:
             self._send(404, "text/plain", b"Not found")
@@ -1224,19 +1286,22 @@ def _finalize_output(job_id, output_path, output_name, fps, encoder, transparent
     gif_bytes = os.path.getsize(output_path)
     size_str = f"{gif_bytes/1024:.0f} KB" if gif_bytes < 1024*1024 else f"{gif_bytes/1024/1024:.1f} MB"
 
-    probe = subprocess.run(
-        ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
-         "-count_packets",
-         "-show_entries", "stream=width,height,nb_read_packets",
-         "-of", "csv=p=0", output_path],
-        capture_output=True, text=True
-    )
     w, h, frames_count = "?", "?", "?"
-    parts_out = probe.stdout.strip().split(",")
-    if len(parts_out) >= 2:
-        w, h = parts_out[0], parts_out[1]
-    if len(parts_out) >= 3 and parts_out[2].strip():
-        frames_count = parts_out[2].strip()
+    try:
+        probe = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+             "-count_packets",
+             "-show_entries", "stream=width,height,nb_read_packets",
+             "-of", "csv=p=0", output_path],
+            capture_output=True, text=True, timeout=30
+        )
+        parts_out = probe.stdout.strip().split(",")
+        if len(parts_out) >= 2:
+            w, h = parts_out[0], parts_out[1]
+        if len(parts_out) >= 3 and parts_out[2].strip():
+            frames_count = parts_out[2].strip()
+    except Exception:
+        pass  # GIF already encoded; a hung/failed probe shouldn't fail the job
 
     with jobs_lock:
         if job_id not in jobs:  # job evicted/expired mid-run — discard output
