@@ -40,7 +40,18 @@ ALLOWED_MIME_PREFIXES = ("video/", "application/octet-stream")
 ALLOWED_ENCODERS = {"gifski", "libvips", "ffmpeg-high", "ffmpeg-med"}
 ALLOWED_WIDTHS = {"original", "1000", "800", "640", "480", "320"}
 ALLOWED_LOOPS = {0, 1, 2}
-ALLOWED_SPEED_FACTORS = {1.0, 2.0, 3.0, 4.0}
+# Speed: form value -> time-stretch multiplier. >1 plays slower (every sampled
+# frame is held longer); <1 plays faster (fewer source frames are sampled so
+# the chosen fps stays the playback rate).
+SPEED_OPTIONS = {
+    "1/4": 0.25,
+    "1/3": 1.0 / 3.0,
+    "1/2": 0.5,
+    "1": 1.0,
+    "2": 2.0,
+    "3": 3.0,
+    "4": 4.0,
+}
 # Photo-series canvas: how the common frame size is derived.
 ALLOWED_CANVAS = {"first", "bbox", "1:1", "16:9", "9:16"}
 BASE_DIR = Path(__file__).parent
@@ -513,6 +524,9 @@ HTML = """<!DOCTYPE html>
     <div class="option-group">
       <label>Speed</label>
       <select id="speed">
+        <option value="1/4">4x faster</option>
+        <option value="1/3">3x faster</option>
+        <option value="1/2">2x faster</option>
         <option value="1" selected>Normal</option>
         <option value="2">2x slower</option>
         <option value="3">3x slower</option>
@@ -805,7 +819,8 @@ function showResult(data) {
     resultGif.classList.remove('checkerboard');
   }
   const encoderLabel = {'gifski':'Gifski','ffmpeg-high':'ffmpeg (2-pass)','libvips':'libvips','ffmpeg-med':'ffmpeg'}[data.encoder] || data.encoder;
-  const speedLabel = data.speed_factor && data.speed_factor !== 1 ? ` · ${data.speed_factor}x slower` : '';
+  const sf = data.speed_factor;
+  const speedLabel = !sf || sf === 1 ? '' : sf > 1 ? ` · ${sf}x slower` : ` · ${Math.round(1 / sf)}x faster`;
   resultMeta.textContent = `${data.width}×${data.height} · ${data.size} · ${data.frames} frames · ${data.fps} fps${speedLabel} · ${encoderLabel}`;
   downloadBtn.href = data.url;
   downloadBtn.download = data.filename;
@@ -1064,10 +1079,18 @@ def _parse_float(value, default, minimum=None, maximum=None):
 
 
 def _parse_speed_factor(value) -> float:
-    speed_factor = _parse_float(value, default=1.0)
-    if speed_factor not in ALLOWED_SPEED_FACTORS:
-        raise ValueError("Unsupported speed option")
-    return speed_factor
+    key = str(value).strip() if value is not None else ""
+    if not key:
+        return 1.0
+    if key in SPEED_OPTIONS:
+        return SPEED_OPTIONS[key]
+    # Numeric spellings of a preset ("2.0", "0.5") are accepted too.
+    parsed = _parse_float(key, default=None)
+    if parsed is not None:
+        for factor in SPEED_OPTIONS.values():
+            if abs(parsed - factor) < 1e-6:
+                return factor
+    raise ValueError("Unsupported speed option")
 
 
 def _parse_time(value, label):
@@ -1247,7 +1270,7 @@ def _canvas_dims(canvas: str, sizes: list) -> tuple[int, int]:
     return sizes[0]  # "first" (default)
 
 
-def enforce_clip_limits(source_duration: float, start: str, end: str, fps: int):
+def enforce_clip_limits(source_duration: float, start: str, end: str, fps: float):
     start_s = float(start) if start else 0.0
     end_s = float(end) if end else source_duration
     if start_s >= source_duration:
@@ -1264,24 +1287,48 @@ def enforce_clip_limits(source_duration: float, start: str, end: str, fps: int):
 
 
 def _video_filter(fps, width_opt, speed_factor=1.0):
-    """Build the ffmpeg video filter chain for sampled GIF frames."""
+    """Build the ffmpeg video filter chain for sampled GIF frames.
+
+    ``fps`` is the source sampling rate (see ``_sample_fps``). With a
+    ``speed_factor`` the timeline is stretched first and then resampled at the
+    playback rate (sample rate / factor), so the stream's declared frame rate
+    matches its timestamps. Sampling first and compressing afterwards leaves
+    the two disagreeing, and ffmpeg drops frames to reconcile them (2x faster
+    came out with 24 frames instead of 45 on the direct ffmpeg encoders).
+    """
     if width_opt == "original":
         scale = "scale=iw:ih"
     else:
         scale = f"scale={width_opt}:-2:flags=lanczos"
-    filters = [f"fps={fps}"]
     if speed_factor != 1.0:
-        filters.append(f"setpts={speed_factor}*PTS")
+        filters = [f"setpts={speed_factor}*PTS", f"fps={_clean_fps(fps / speed_factor)}"]
+    else:
+        filters = [f"fps={fps}"]
     filters.append(scale)
     return ",".join(filters)
 
 
+def _clean_fps(value):
+    """Round to 4 decimals and drop a trailing .0 so ffmpeg reads fps=15, not 15.0."""
+    value = round(value, 4)
+    return int(value) if float(value).is_integer() else value
+
+
 def _playback_fps(fps, speed_factor):
-    return round(fps / speed_factor, 4)
+    """GIF playback rate. Slowing down holds each frame longer, so the rate
+    drops; speeding up keeps the chosen fps and samples fewer frames instead."""
+    return round(fps / max(1.0, speed_factor), 4)
+
+
+def _sample_fps(fps, speed_factor):
+    """Rate at which source frames are pulled. Slowdown samples at the chosen
+    fps; speed-up decimates (15 fps at 2x faster reads 7.5 source frames per
+    second and plays them back at 15)."""
+    return _clean_fps(fps * min(1.0, speed_factor))
 
 
 def _frame_delay_ms(fps, speed_factor):
-    return max(10, round(1000 * speed_factor / fps))
+    return max(10, round(1000 / _playback_fps(fps, speed_factor)))
 
 
 def _finalize_output(job_id, output_path, output_name, fps, encoder, transparent, speed_factor=1.0):
@@ -1427,9 +1474,10 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
         transparent = params["transparent"]
         speed_factor = params["speed_factor"]
         playback_fps = _playback_fps(fps, speed_factor)
+        sample_fps = _sample_fps(fps, speed_factor)
         ffmpeg_loop, gifski_repeat = loop_values(loop)
         source_duration = probe_duration(input_path)
-        clip_duration, estimated_frames = enforce_clip_limits(source_duration, start, end, fps)
+        clip_duration, estimated_frames = enforce_clip_limits(source_duration, start, end, sample_fps)
 
         # ffmpeg single-pass cannot produce transparent GIFs; auto-upgrade
         if transparent and encoder == "ffmpeg-med":
@@ -1438,8 +1486,8 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
         output_name = f"{job_id}.gif"
         output_path = str(OUTPUT_DIR / output_name)
 
-        vf_sample = _video_filter(fps, width_opt)
-        vf_playback = _video_filter(fps, width_opt, speed_factor)
+        vf_sample = _video_filter(sample_fps, width_opt)
+        vf_playback = _video_filter(sample_fps, width_opt, speed_factor)
 
         # ffmpeg time-range args
         time_args = []

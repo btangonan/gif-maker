@@ -55,9 +55,23 @@ class ValidationTests(unittest.TestCase):
 
                 self.assertEqual(params["speed_factor"], float(speed))
 
+    def test_validate_params_accepts_speedup_option(self):
+        for speed, factor in (("1/2", 0.5), ("1/3", 1 / 3), ("1/4", 0.25)):
+            with self.subTest(speed=speed):
+                params = app.validate_params(valid_params(speed=speed))
+
+                self.assertAlmostEqual(params["speed_factor"], factor)
+
+    def test_validate_params_accepts_numeric_speed_spellings(self):
+        self.assertEqual(app.validate_params(valid_params(speed="2.0"))["speed_factor"], 2.0)
+        self.assertEqual(app.validate_params(valid_params(speed="0.5"))["speed_factor"], 0.5)
+        self.assertEqual(app.validate_params(valid_params(speed=""))["speed_factor"], 1.0)
+
     def test_validate_params_rejects_unsupported_speed(self):
-        with self.assertRaisesRegex(ValueError, "Unsupported speed"):
-            app.validate_params(valid_params(speed="5"))
+        for speed in ("5", "0", "1/5", "abc"):
+            with self.subTest(speed=speed):
+                with self.assertRaisesRegex(ValueError, "Unsupported speed"):
+                    app.validate_params(valid_params(speed=speed))
 
     def test_validate_params_defaults_encoder_to_libvips(self):
         params = valid_params()
@@ -177,6 +191,12 @@ class ImageModeValidationTests(unittest.TestCase):
             0.25,
         )
 
+    def test_speedup_halves_seconds_per_photo(self):
+        self.assertEqual(
+            app.validate_params(image_params(["a.png"], seconds_per_photo="2", speed="1/2"))["fps"],
+            1.0,
+        )
+
     def test_seconds_per_photo_defaults_to_one_second(self):
         params = image_params(["a.png"])  # no seconds_per_photo provided
         self.assertEqual(app.validate_params(params)["fps"], 1.0)
@@ -287,9 +307,11 @@ class ResourceLimitTests(unittest.TestCase):
 
 class TimingHelperTests(unittest.TestCase):
     def test_video_filter_adds_setpts_for_slowdown(self):
+        # Stretch first, then resample at the playback rate so ffmpeg's frame
+        # sync has nothing to duplicate or drop.
         self.assertEqual(
             app._video_filter(15, "640", 2.0),
-            "fps=15,setpts=2.0*PTS,scale=640:-2:flags=lanczos",
+            "setpts=2.0*PTS,fps=7.5,scale=640:-2:flags=lanczos",
         )
 
     def test_video_filter_omits_setpts_for_normal_speed(self):
@@ -302,6 +324,38 @@ class TimingHelperTests(unittest.TestCase):
     def test_playback_fps_scales_with_speed_factor(self):
         self.assertEqual(app._playback_fps(15, 2.0), 7.5)
         self.assertEqual(app._playback_fps(16, 4.0), 4.0)
+
+    def test_video_filter_adds_setpts_for_speedup(self):
+        self.assertEqual(
+            app._video_filter(7.5, "640", 0.5),
+            "setpts=0.5*PTS,fps=15,scale=640:-2:flags=lanczos",
+        )
+        self.assertEqual(
+            app._video_filter(5, "original", 1 / 3),
+            f"setpts={1 / 3}*PTS,fps=15,scale=iw:ih",
+        )
+
+    def test_sample_fps_decimates_only_for_speedup(self):
+        # Speed-up pulls fewer source frames; slowdown keeps sampling at the chosen fps.
+        self.assertEqual(app._sample_fps(15, 0.5), 7.5)
+        self.assertEqual(app._sample_fps(15, 1 / 3), 5)
+        self.assertEqual(app._sample_fps(30, 0.25), 7.5)
+        self.assertEqual(app._sample_fps(15, 2.0), 15)
+        self.assertEqual(app._sample_fps(15, 1.0), 15)
+
+    def test_playback_fps_keeps_chosen_fps_for_speedup(self):
+        self.assertEqual(app._playback_fps(15, 0.5), 15.0)
+        self.assertEqual(app._playback_fps(30, 0.25), 30.0)
+
+    def test_frame_delay_for_speedup_matches_chosen_fps(self):
+        self.assertEqual(app._frame_delay_ms(15, 0.5), 67)
+        self.assertEqual(app._frame_delay_ms(30, 0.25), 33)
+
+    def test_clip_limits_use_fractional_sample_fps(self):
+        # 10 s at 4x faster with 15 fps samples 3.75 frames/s -> 38 frames, not 150.
+        clip_duration, estimated_frames = app.enforce_clip_limits(10.0, "", "", 3.75)
+        self.assertEqual(clip_duration, 10.0)
+        self.assertEqual(estimated_frames, 38)
 
 
 class CleanupLoopTests(unittest.TestCase):
