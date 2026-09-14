@@ -595,17 +595,23 @@ const fpsLabel = document.getElementById('fpsLabel');
 function renderRateVal() {
   fpsVal.textContent = selectedImages ? fps.value + 's' : fps.value;
 }
+// Remember the last value per mode so a new upload keeps the user's setting.
+const rateByMode = { video: '15', images: '1' };
+let rateMode = 'video';
 function setRateControl(mode) {
   const canvasGroup = document.getElementById('canvasGroup');
+  rateByMode[rateMode] = fps.value;
+  rateMode = mode;
   if (mode === 'images') {
     fpsLabel.textContent = 'Seconds per photo';
-    fps.min = '0.25'; fps.max = '10'; fps.step = '0.25'; fps.value = '1';
+    fps.min = '0.25'; fps.max = '10'; fps.step = '0.25';
     canvasGroup.style.display = '';  // photo-only control
   } else {
     fpsLabel.textContent = 'FPS';
-    fps.min = '1'; fps.max = '30'; fps.step = '1'; fps.value = '15';
+    fps.min = '1'; fps.max = '30'; fps.step = '1';
     canvasGroup.style.display = 'none';
   }
+  fps.value = rateByMode[mode];
   renderRateVal();
 }
 fps.addEventListener('input', renderRateVal);
