@@ -1444,6 +1444,9 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
             ]
             if width_opt != "original":
                 gifski_cmd += ["-W", width_opt]
+            else:
+                # gifski caps output at ~800x600 unless given explicit bounds.
+                gifski_cmd += ["-W", str(tw), "-H", str(th)]
             gifski_cmd += frame_paths
             result = subprocess.run(gifski_cmd, capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
@@ -1521,12 +1524,17 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
                 raise RuntimeError("No frames extracted from video")
 
             update("Encoding with Gifski…")
+            # Frames are already scaled by ffmpeg; pin gifski to their exact size,
+            # since it otherwise caps output at ~800x600 (1920x1080 -> 960x540).
+            frame_w, frame_h = _probe_image_size(frames[0], "extracted frame")
             gifski_cmd = [
                 "gifski",
                 "--no-sort",
                 "--fps", str(playback_fps),
                 "--quality", "90",
                 "--repeat", str(gifski_repeat),
+                "-W", str(frame_w),
+                "-H", str(frame_h),
                 "-o", output_path,
             ]
             gifski_cmd += frames
