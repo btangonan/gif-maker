@@ -904,7 +904,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "image/gif")
                 self.send_header("Content-Length", str(len(data)))
-                self.send_header("Content-Disposition", f'attachment; filename="{fname}"')
+                with jobs_lock:
+                    job = jobs.get(fpath.stem) or {}
+                self.send_header("Content-Disposition", _content_disposition(job.get("filename") or fname))
                 self.end_headers()
                 self.wfile.write(data)
             else:
@@ -1347,7 +1349,25 @@ def _frame_delay_ms(fps, speed_factor):
     return max(10, round(1000 / _playback_fps(fps, speed_factor)))
 
 
-def _finalize_output(job_id, output_path, output_name, fps, encoder, transparent, speed_factor=1.0):
+def _download_name(source_filename) -> str:
+    """Download filename for a GIF: the source's stem + .gif ("clip.mov" -> "clip.gif").
+    Strips path parts, quotes, reserved and control characters; falls back to "animation"."""
+    base = re.split(r"[\\/]", source_filename or "")[-1]
+    stem = base.rsplit(".", 1)[0] if "." in base.lstrip(".") else base
+    stem = "".join(c for c in stem if ord(c) >= 32 and ord(c) != 127 and c not in '"*:<>?|')
+    stem = stem.strip(" .")[:120].strip(" .")
+    return f"{stem or 'animation'}.gif"
+
+
+def _content_disposition(filename: str) -> str:
+    """attachment header with an ASCII fallback plus RFC 5987 UTF-8 name."""
+    ascii_name = "".join(c if 32 <= ord(c) < 127 else "_" for c in filename)
+    return (f'attachment; filename="{ascii_name}"; '
+            f"filename*=UTF-8''{urllib.parse.quote(filename, safe='')}")
+
+
+def _finalize_output(job_id, output_path, output_name, fps, encoder, transparent, speed_factor=1.0,
+                     source_name=None):
     """Probe the finished GIF and publish the done status (shared by all modes)."""
     gif_bytes = os.path.getsize(output_path)
     size_str = f"{gif_bytes/1024:.0f} KB" if gif_bytes < 1024*1024 else f"{gif_bytes/1024/1024:.1f} MB"
@@ -1377,7 +1397,7 @@ def _finalize_output(job_id, output_path, output_name, fps, encoder, transparent
         jobs[job_id] = {
             "status": "done",
             "url": f"/output/{output_name}",
-            "filename": output_name,
+            "filename": _download_name(source_name) if source_name else output_name,
             "size": size_str,
             "width": w,
             "height": h,
@@ -1468,7 +1488,8 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
                 raise RuntimeError(f"Gifski failed:\n{result.stderr[-800:]}")
 
             _finalize_output(job_id, output_path, output_name, fps, "gifski",
-                             params["transparent"], params["speed_factor"])
+                             params["transparent"], params["speed_factor"],
+                             source_name=params["images"][0]["filename"])
             return
 
         update("Saving uploaded video…")
@@ -1630,7 +1651,8 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
                 raise RuntimeError(f"GIF conversion failed:\n{result.stderr[-800:]}")
 
         # ── Gather output info ────────────────────────────────────────────────
-        _finalize_output(job_id, output_path, output_name, playback_fps, encoder, transparent, speed_factor)
+        _finalize_output(job_id, output_path, output_name, playback_fps, encoder, transparent, speed_factor,
+                         source_name=video_data.get("filename"))
 
     except Exception as e:
         with jobs_lock:

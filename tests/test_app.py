@@ -446,7 +446,34 @@ class HandlerPathTests(unittest.TestCase):
         self.assertEqual(response["body"], b"GIF89a")
         self.assertIn(("Content-Type", "image/gif"), response["headers"])
         self.assertIn(("Content-Length", "6"), response["headers"])
-        self.assertIn(("Content-Disposition", 'attachment; filename="job123.gif"'), response["headers"])
+        self.assertIn(
+            ("Content-Disposition", "attachment; filename=\"job123.gif\"; filename*=UTF-8''job123.gif"),
+            response["headers"],
+        )
+
+    def test_output_download_uses_source_name_from_job(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir)
+            (output_dir / "job456.gif").write_bytes(b"GIF89a")
+
+            with mock.patch.object(app, "OUTPUT_DIR", output_dir), \
+                    mock.patch.dict(app.jobs, {"job456": {"status": "done", "filename": "café clip.gif"}}):
+                response = call_handler_get("/output/job456.gif")
+
+        self.assertIn(
+            ("Content-Disposition", "attachment; filename=\"caf_ clip.gif\"; filename*=UTF-8''caf%C3%A9%20clip.gif"),
+            response["headers"],
+        )
+
+    def test_download_name_follows_source_and_is_sanitized(self):
+        self.assertEqual(app._download_name("My Trip.mov"), "My Trip.gif")
+        self.assertEqual(app._download_name("clip.final.mp4"), "clip.final.gif")
+        self.assertEqual(app._download_name("C:\\Users\\x\\vid.webm"), "vid.gif")
+        self.assertEqual(app._download_name('a"b\r\n<c>.mp4'), "abc.gif")
+        self.assertEqual(app._download_name(".mp4"), "mp4.gif")
+        self.assertEqual(app._download_name(""), "animation.gif")
+        self.assertEqual(app._download_name(None), "animation.gif")
+        self.assertEqual(len(app._download_name("x" * 500 + ".mp4")), 124)
 
     def test_output_download_rejects_non_gif_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
