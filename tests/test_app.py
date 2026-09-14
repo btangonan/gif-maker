@@ -83,6 +83,25 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported resolution"):
             app.validate_params(valid_params(height="999;rm -rf /"))
 
+    def test_validate_params_quality_defaults_high_and_rejects_unknown(self):
+        self.assertEqual(app.validate_params(valid_params())["quality"], "high")
+        self.assertEqual(app.validate_params(valid_params(quality="small"))["quality"], "small")
+        with self.assertRaisesRegex(ValueError, "Unsupported quality"):
+            app.validate_params(valid_params(quality="ultra"))
+
+    def test_size_table_covers_every_encoder_and_quality(self):
+        for encoder in app.ALLOWED_ENCODERS - {"ffmpeg-med"}:
+            self.assertEqual(set(app.SIZE_BPP[encoder]), set(app.QUALITY_SETTINGS))
+        for ranges in app.SIZE_BPP.values():
+            for low, high in ranges.values():
+                self.assertLess(low, high)
+
+    def test_index_page_substitutes_size_table(self):
+        response = call_handler_get("/")
+        body = response["body"].decode("utf-8")
+        self.assertNotIn("__SIZE_BPP__", body)
+        self.assertIn('const SIZE_BPP = {"gifski": {"high": [0.255, 0.646]', body)
+
     def test_validate_params_rejects_bad_time_range(self):
         with self.assertRaisesRegex(ValueError, "End time must be greater"):
             app.validate_params(valid_params(start="5", end="4"))

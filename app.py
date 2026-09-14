@@ -40,6 +40,25 @@ ALLOWED_MIME_PREFIXES = ("video/", "application/octet-stream")
 ALLOWED_ENCODERS = {"gifski", "libvips", "ffmpeg-high", "ffmpeg-med"}
 ALLOWED_HEIGHTS = {"original", "2160", "1080", "720", "640", "480"}
 ALLOWED_LOOPS = {0, 1, 2}
+# Size estimate: output bytes per pixel-frame, [low, high] = min-max measured
+# 2026-09-14 on 4 real clips (3s, 12fps, 480p and 720p) per encoder and quality;
+# photos = gifski on distinct stills. Clean footage lands low, grain and motion
+# high; a 25th-75th percentile band under-predicted a busy clip by ~25%.
+SIZE_BPP = {
+    "gifski":      {"high": [0.255, 0.646], "medium": [0.113, 0.488], "small": [0.049, 0.257]},
+    "ffmpeg-high": {"high": [0.542, 0.852], "medium": [0.184, 0.735], "small": [0.141, 0.588]},
+    "libvips":     {"high": [0.431, 0.846], "medium": [0.152, 0.690], "small": [0.081, 0.520]},
+    "ffmpeg-med":  {"high": [0.111, 0.463]},
+    "photos":      {"high": [0.522, 0.581], "medium": [0.385, 0.450], "small": [0.216, 0.292]},
+}
+# Quality presets -> per-encoder knobs (single-pass ffmpeg has none). Measured on
+# 4s 480p clips: gifski 8.5/4.2/1.8 MB; libvips interframe_maxerror reuses
+# near-identical pixels between frames, which shrinks grainy footage most.
+QUALITY_SETTINGS = {
+    "high":   {"gifski": 90, "palette_colors": 256, "vips_bitdepth": 8, "vips_interframe_maxerror": 0},
+    "medium": {"gifski": 70, "palette_colors": 128, "vips_bitdepth": 7, "vips_interframe_maxerror": 8},
+    "small":  {"gifski": 50, "palette_colors": 64,  "vips_bitdepth": 6, "vips_interframe_maxerror": 16},
+}
 # Speed: form value -> time-stretch multiplier. >1 plays slower (every sampled
 # frame is held longer); <1 plays faster (fewer source frames are sampled so
 # the chosen fps stays the playback rate).
@@ -381,6 +400,13 @@ HTML = """<!DOCTYPE html>
     background: repeating-conic-gradient(#e0e0e0 0% 25%, #fff 0% 50%) 0 0 / 16px 16px;
   }
 
+  .size-estimate {
+    margin-top: 12px;
+    text-align: center;
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: var(--text-muted);
+  }
   .result-meta {
     font-size: 0.8rem;
     font-weight: 500;
@@ -513,6 +539,15 @@ HTML = """<!DOCTYPE html>
     </div>
 
     <div class="option-group">
+      <label>Quality</label>
+      <select id="quality">
+        <option value="high" selected>High</option>
+        <option value="medium">Medium</option>
+        <option value="small">Small file</option>
+      </select>
+    </div>
+
+    <div class="option-group">
       <label>Loop</label>
       <select id="loop">
         <option value="0" selected>Forever</option>
@@ -542,6 +577,8 @@ HTML = """<!DOCTYPE html>
       </select>
     </div>
   </div>
+
+  <div class="size-estimate" id="sizeEstimate" hidden></div>
 
   <button class="convert-btn" id="convertBtn" disabled>Select a video or photos</button>
 
@@ -666,6 +703,7 @@ function setImages(files) {
   convertBtn.disabled = false;
   convertBtn.textContent = 'Convert to GIF →';
   resultSection.classList.remove('visible');
+  probeSelection();
 }
 
 function setFile(file) {
@@ -688,6 +726,7 @@ function setFile(file) {
   convertBtn.disabled = false;
   convertBtn.textContent = 'Convert to GIF →';
   resultSection.classList.remove('visible');
+  probeSelection();
 }
 
 function clearSelection() {
@@ -704,12 +743,109 @@ function clearSelection() {
   fileSize.textContent = '';
   convertBtn.disabled = true;
   convertBtn.textContent = 'Select a video or photos';
+  probeSelection();
 }
 
 function formatBytes(b) {
   if (b < 1024*1024) return (b/1024).toFixed(1) + ' KB';
   return (b/(1024*1024)).toFixed(1) + ' MB';
 }
+
+// ── Size estimate ─────────────────────────────────────────────────────────────
+// Output bytes ≈ pixels × frames × bytes-per-pixel. The [low, high] bytes-per-pixel
+// ranges were measured on real clips; content (grain, motion) moves a GIF within it.
+const SIZE_BPP = __SIZE_BPP__;
+const sizeEstimate = document.getElementById('sizeEstimate');
+let sourceInfo = null;  // {w, h, duration} for a video, {sizes: [[w, h], …]} for photos
+let probeToken = 0;
+
+function probeSelection() {
+  const token = ++probeToken;
+  sourceInfo = null;
+  updateEstimate();
+  const done = info => { if (token === probeToken) { sourceInfo = info; updateEstimate(); } };
+  if (selectedFile) {
+    const url = URL.createObjectURL(selectedFile);
+    const v = document.createElement('video');
+    v.preload = 'metadata';
+    v.muted = true;
+    v.onloadedmetadata = () => {
+      done(v.videoWidth && v.duration ? { w: v.videoWidth, h: v.videoHeight, duration: v.duration } : null);
+      URL.revokeObjectURL(url);
+    };
+    v.onerror = () => { done(null); URL.revokeObjectURL(url); };
+    v.src = url;
+  } else if (selectedImages) {
+    Promise.all(selectedImages.map(f => new Promise(resolve => {
+      const url = URL.createObjectURL(f);
+      const img = new Image();
+      img.onload = () => { resolve([img.naturalWidth, img.naturalHeight]); URL.revokeObjectURL(url); };
+      img.onerror = () => { resolve(null); URL.revokeObjectURL(url); };
+      img.src = url;
+    }))).then(sizes => done(sizes.every(Boolean) ? { sizes } : null));
+  }
+}
+
+// evenWidth mirrors ffmpeg's scale=-2 for video; photos use plain rounding (_fit_height).
+function fitHeight(w, h, evenWidth) {
+  const opt = document.getElementById('height').value;
+  if (opt === 'original' || h <= +opt) return [w, h];
+  const scaled = w * +opt / h;
+  return [evenWidth ? 2 * Math.round(scaled / 2) : Math.max(1, Math.round(scaled)), +opt];
+}
+
+function formatRange(lo, hi) {
+  const MB = 1024 * 1024;
+  if (hi < MB) return `${Math.round(lo / 1024)}–${Math.round(hi / 1024)} KB`;
+  const mb = v => (v < 10 * MB ? (v / MB).toFixed(1) : Math.round(v / MB));
+  return `${mb(lo)}–${mb(hi)} MB`;
+}
+
+// Mirrors _canvas_dims in the server.
+function canvasDims(sizes) {
+  const mode = document.getElementById('canvas').value;
+  const maxW = Math.max(...sizes.map(s => s[0])), maxH = Math.max(...sizes.map(s => s[1]));
+  if (mode === 'bbox') return [maxW, maxH];
+  if (mode === '1:1' || mode === '16:9' || mode === '9:16') {
+    const longest = Math.max(maxW, maxH);
+    if (mode === '1:1') return [longest, longest];
+    const short = Math.max(1, Math.round(longest * 9 / 16));
+    return mode === '16:9' ? [longest, short] : [short, longest];
+  }
+  return sizes[0];
+}
+
+function updateEstimate() {
+  if (!sourceInfo || !SIZE_BPP) { sizeEstimate.hidden = true; return; }
+  const quality = document.getElementById('quality').value;
+  let w, h, frames, table;
+  if (sourceInfo.sizes) {
+    [w, h] = fitHeight(...canvasDims(sourceInfo.sizes));
+    frames = sourceInfo.sizes.length;
+    table = SIZE_BPP.photos;
+  } else {
+    [w, h] = fitHeight(sourceInfo.w, sourceInfo.h, true);
+    const start = Math.max(0, parseFloat(document.getElementById('startTime').value) || 0);
+    const endVal = parseFloat(document.getElementById('endTime').value);
+    const end = Math.min(sourceInfo.duration, endVal > 0 ? endVal : sourceInfo.duration);
+    const [num, den] = document.getElementById('speed').value.split('/').map(Number);
+    const speed = den ? num / den : num;
+    const sampleFps = speed < 1 ? +fps.value * speed : +fps.value;
+    frames = Math.max(0, Math.ceil((end - start) * sampleFps - 1e-9));
+    table = SIZE_BPP[document.getElementById('encoder').value];
+  }
+  const range = table[quality] || table.high;
+  const px = w * h * frames;
+  if (!px) { sizeEstimate.hidden = true; return; }
+  sizeEstimate.textContent = `Estimated size: ${formatRange(px * range[0], px * range[1])} · ${w}×${h} · ${frames} frames`;
+  sizeEstimate.hidden = false;
+}
+
+['fps', 'height', 'canvas', 'startTime', 'endTime', 'encoder', 'quality', 'speed'].forEach(id => {
+  const el = document.getElementById(id);
+  el.addEventListener('input', updateEstimate);
+  el.addEventListener('change', updateEstimate);
+});
 
 // Convert
 convertBtn.addEventListener('click', async () => {
@@ -738,6 +874,7 @@ convertBtn.addEventListener('click', async () => {
   formData.append('encoder', document.getElementById('encoder').value);
   formData.append('loop', document.getElementById('loop').value);
   formData.append('speed', document.getElementById('speed').value);
+  formData.append('quality', document.getElementById('quality').value);
   formData.append('transparent', document.getElementById('transparent').value);
 
   try {
@@ -872,7 +1009,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
 
         if path == "/" or path == "/index.html":
-            html = HTML.replace("__MAX_UPLOAD_MB__", str(MAX_UPLOAD_MB))
+            html = (HTML.replace("__MAX_UPLOAD_MB__", str(MAX_UPLOAD_MB))
+                        .replace("__SIZE_BPP__", json.dumps(SIZE_BPP)))
             self._send(200, "text/html", html.encode())
 
         elif path == "/healthz":
@@ -1136,6 +1274,9 @@ def validate_params(params: dict) -> dict:
 
     transparent = params.get("transparent", "0") == "1"
     speed_factor = _parse_speed_factor(params.get("speed", "1"))
+    quality = (params.get("quality", "high") or "high").strip()
+    if quality not in QUALITY_SETTINGS:
+        raise ValueError("Unsupported quality option")
 
     if has_images:
         if len(images) > MAX_OUTPUT_FRAMES:
@@ -1174,6 +1315,7 @@ def validate_params(params: dict) -> dict:
             "loop": loop,
             "speed_factor": speed_factor,
             "transparent": transparent,
+            "quality": quality,
         }
 
     # Video mode
@@ -1212,6 +1354,7 @@ def validate_params(params: dict) -> dict:
         "loop": loop,
         "speed_factor": speed_factor,
         "transparent": transparent,
+        "quality": quality,
     }
 
 
@@ -1427,6 +1570,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
             fps = params["fps"]
             height_opt = params["height"]
             transparent = params["transparent"]
+            q = QUALITY_SETTINGS[params.get("quality", "high")]
             _, gifski_repeat = loop_values(params["loop"])
             output_name = f"{job_id}.gif"
             output_path = str(OUTPUT_DIR / output_name)
@@ -1474,7 +1618,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
                 "gifski",
                 "--no-sort",  # preserve given (drop) order, don't re-sort
                 "--fps", str(fps),
-                "--quality", "90",
+                "--quality", str(q["gifski"]),
                 "--repeat", str(gifski_repeat),
                 # Frames are already tw x th; gifski caps output at ~800x600
                 # unless given explicit bounds.
@@ -1512,6 +1656,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
         loop = params["loop"]
         transparent = params["transparent"]
         speed_factor = params["speed_factor"]
+        q = QUALITY_SETTINGS[params.get("quality", "high")]
         playback_fps = _playback_fps(fps, speed_factor)
         sample_fps = _sample_fps(fps, speed_factor)
         ffmpeg_loop, gifski_repeat = loop_values(loop)
@@ -1567,7 +1712,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
                 "gifski",
                 "--no-sort",
                 "--fps", str(playback_fps),
-                "--quality", "90",
+                "--quality", str(q["gifski"]),
                 "--repeat", str(gifski_repeat),
                 "-W", str(frame_w),
                 "-H", str(frame_h),
@@ -1613,7 +1758,9 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
             joined.set_type(pyvips.GValue.array_int_type, "delay", [delay_ms] * len(images))
             joined.set_type(pyvips.GValue.gint_type, "page-height", images[0].height)
             joined.set_type(pyvips.GValue.gint_type, "loop", ffmpeg_loop)
-            joined.gifsave(output_path, effort=7, dither=1.0)
+            # Interframe pixel reuse is skipped for transparent output, which relies on real alpha.
+            joined.gifsave(output_path, effort=7, dither=1.0, bitdepth=q["vips_bitdepth"],
+                           interframe_maxerror=0 if transparent else q["vips_interframe_maxerror"])
 
         # ── ffmpeg high (2-pass palette) ──────────────────────────────────────
         elif encoder == "ffmpeg-high":
@@ -1622,7 +1769,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
             reserve = "1" if transparent else "0"
             r = subprocess.run(
                 ["ffmpeg", "-y", *time_args, "-i", input_path,
-                 "-vf", f"{vf_sample},palettegen=stats_mode=diff:reserve_transparent={reserve}", palette_path],
+                 "-vf", f"{vf_sample},palettegen=stats_mode=diff:max_colors={q['palette_colors']}:reserve_transparent={reserve}", palette_path],
                 capture_output=True, text=True, timeout=120
             )
             if r.returncode != 0:
