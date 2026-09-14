@@ -25,7 +25,7 @@ def valid_params(**overrides):
             "data": b"not-real-video",
         },
         "fps": "15",
-        "width": "640",
+        "height": "480",
         "encoder": "ffmpeg-high",
         "loop": "0",
         "start": "",
@@ -79,9 +79,9 @@ class ValidationTests(unittest.TestCase):
 
         self.assertEqual(app.validate_params(params)["encoder"], "libvips")
 
-    def test_validate_params_rejects_unsupported_width(self):
-        with self.assertRaisesRegex(ValueError, "Unsupported width"):
-            app.validate_params(valid_params(width="999;rm -rf /"))
+    def test_validate_params_rejects_unsupported_resolution(self):
+        with self.assertRaisesRegex(ValueError, "Unsupported resolution"):
+            app.validate_params(valid_params(height="999;rm -rf /"))
 
     def test_validate_params_rejects_bad_time_range(self):
         with self.assertRaisesRegex(ValueError, "End time must be greater"):
@@ -98,7 +98,7 @@ def image_params(filenames, **overrides):
         {"filename": fn, "content_type": "image/png", "data": b"x" * 10}
         for fn in filenames
     ]
-    params = {"images": images, "fps": "1", "width": "640", "loop": "0", "transparent": "0"}
+    params = {"images": images, "fps": "1", "height": "480", "loop": "0", "transparent": "0"}
     params.update(overrides)
     return params
 
@@ -311,8 +311,14 @@ class TimingHelperTests(unittest.TestCase):
         # sync has nothing to duplicate or drop.
         self.assertEqual(
             app._video_filter(15, "640", 2.0),
-            "setpts=2.0*PTS,fps=7.5,scale=640:-2:flags=lanczos",
+            "setpts=2.0*PTS,fps=7.5,scale=-2:'min(ih,640)':flags=lanczos",
         )
+
+    def test_fit_height_downscales_only(self):
+        self.assertEqual(app._fit_height(1920, 1080, "720"), (1280, 720))
+        self.assertEqual(app._fit_height(1920, 1080, "2160"), (1920, 1080))
+        self.assertEqual(app._fit_height(1080, 1920, "480"), (270, 480))
+        self.assertEqual(app._fit_height(1600, 1200, "original"), (1600, 1200))
 
     def test_video_filter_omits_setpts_for_normal_speed(self):
         self.assertEqual(app._video_filter(15, "original"), "fps=15,scale=iw:ih")
@@ -328,7 +334,7 @@ class TimingHelperTests(unittest.TestCase):
     def test_video_filter_adds_setpts_for_speedup(self):
         self.assertEqual(
             app._video_filter(7.5, "640", 0.5),
-            "setpts=0.5*PTS,fps=15,scale=640:-2:flags=lanczos",
+            "setpts=0.5*PTS,fps=15,scale=-2:'min(ih,640)':flags=lanczos",
         )
         self.assertEqual(
             app._video_filter(5, "original", 1 / 3),

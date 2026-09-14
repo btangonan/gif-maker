@@ -38,7 +38,7 @@ ALLOWED_EXTENSIONS = {".mp4", ".mov", ".m4v", ".webm"}
 ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
 ALLOWED_MIME_PREFIXES = ("video/", "application/octet-stream")
 ALLOWED_ENCODERS = {"gifski", "libvips", "ffmpeg-high", "ffmpeg-med"}
-ALLOWED_WIDTHS = {"original", "1000", "800", "640", "480", "320"}
+ALLOWED_HEIGHTS = {"original", "2160", "1080", "720", "640", "480"}
 ALLOWED_LOOPS = {0, 1, 2}
 # Speed: form value -> time-stretch multiplier. >1 plays slower (every sampled
 # frame is held longer); <1 plays faster (fewer source frames are sampled so
@@ -470,14 +470,14 @@ HTML = """<!DOCTYPE html>
     </div>
 
     <div class="option-group">
-      <label>Width</label>
-      <select id="width">
+      <label>Resolution</label>
+      <select id="height">
         <option value="original">Original</option>
-        <option value="1000">1000px</option>
-        <option value="800">800px</option>
-        <option value="640" selected>640px</option>
-        <option value="480">480px</option>
-        <option value="320">320px</option>
+        <option value="2160">2160p</option>
+        <option value="1080">1080p</option>
+        <option value="720">720p</option>
+        <option value="640">640p</option>
+        <option value="480" selected>480p</option>
       </select>
     </div>
 
@@ -732,7 +732,7 @@ convertBtn.addEventListener('click', async () => {
     formData.append('video', selectedFile);
     formData.append('fps', fps.value);
   }
-  formData.append('width', document.getElementById('width').value);
+  formData.append('height', document.getElementById('height').value);
   formData.append('start', document.getElementById('startTime').value || '');
   formData.append('end', document.getElementById('endTime').value || '');
   formData.append('encoder', document.getElementById('encoder').value);
@@ -1124,9 +1124,9 @@ def validate_params(params: dict) -> dict:
         raise ValueError("Upload either one video or a series of images")
 
     # Options common to both modes
-    width_opt = (params.get("width", "640") or "640").strip()
-    if width_opt not in ALLOWED_WIDTHS:
-        raise ValueError("Unsupported width option")
+    height_opt = (params.get("height", "480") or "480").strip()
+    if height_opt not in ALLOWED_HEIGHTS:
+        raise ValueError("Unsupported resolution option")
 
     loop = _parse_int(params.get("loop", "0"), default=0)
     if loop not in ALLOWED_LOOPS:
@@ -1166,7 +1166,7 @@ def validate_params(params: dict) -> dict:
             "mode": "images",
             "images": images,
             "fps": fps,
-            "width": width_opt,
+            "height": height_opt,
             "canvas": canvas,
             "encoder": "gifski",
             "loop": loop,
@@ -1203,7 +1203,7 @@ def validate_params(params: dict) -> dict:
         "mode": "video",
         "video": video_data,
         "fps": fps,
-        "width": width_opt,
+        "height": height_opt,
         "start": start,
         "end": end,
         "encoder": encoder,
@@ -1276,6 +1276,15 @@ def _canvas_dims(canvas: str, sizes: list) -> tuple[int, int]:
     return sizes[0]  # "first" (default)
 
 
+def _fit_height(w: int, h: int, height_opt: str) -> tuple[int, int]:
+    """Scale (w, h) down to the chosen output height, aspect preserved.
+    "original" or a target at/above the source height leaves it unchanged."""
+    if height_opt == "original" or h <= int(height_opt):
+        return w, h
+    target = int(height_opt)
+    return max(1, round(w * target / h)), target
+
+
 def enforce_clip_limits(source_duration: float, start: str, end: str, fps: float):
     start_s = float(start) if start else 0.0
     end_s = float(end) if end else source_duration
@@ -1292,7 +1301,7 @@ def enforce_clip_limits(source_duration: float, start: str, end: str, fps: float
     return clip_duration, estimated_frames
 
 
-def _video_filter(fps, width_opt, speed_factor=1.0):
+def _video_filter(fps, height_opt, speed_factor=1.0):
     """Build the ffmpeg video filter chain for sampled GIF frames.
 
     ``fps`` is the source sampling rate (see ``_sample_fps``). With a
@@ -1302,10 +1311,11 @@ def _video_filter(fps, width_opt, speed_factor=1.0):
     the two disagreeing, and ffmpeg drops frames to reconcile them (2x faster
     came out with 24 frames instead of 45 on the direct ffmpeg encoders).
     """
-    if width_opt == "original":
+    if height_opt == "original":
         scale = "scale=iw:ih"
     else:
-        scale = f"scale={width_opt}:-2:flags=lanczos"
+        # Output height, aspect preserved; never upscale past the source.
+        scale = f"scale=-2:'min(ih,{height_opt})':flags=lanczos"
     if speed_factor != 1.0:
         filters = [f"setpts={speed_factor}*PTS", f"fps={_clean_fps(fps / speed_factor)}"]
     else:
@@ -1395,7 +1405,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
         # ── Image series → GIF ────────────────────────────────────────────────
         if params.get("mode") == "images":
             fps = params["fps"]
-            width_opt = params["width"]
+            height_opt = params["height"]
             transparent = params["transparent"]
             _, gifski_repeat = loop_values(params["loop"])
             output_name = f"{job_id}.gif"
@@ -1416,7 +1426,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
                 sizes.append(_probe_image_size(src_path, img["filename"]))
                 srcs.append((src_path, img["filename"]))
 
-            tw, th = _canvas_dims(params["canvas"], sizes)
+            tw, th = _fit_height(*_canvas_dims(params["canvas"], sizes), height_opt)
             # Crop-to-fill: scale to cover the canvas, then center-crop overflow,
             # so every frame is exactly tw×th. format=rgba keeps source alpha.
             fmt = "format=rgba," if transparent else ""
@@ -1446,13 +1456,12 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
                 "--fps", str(fps),
                 "--quality", "90",
                 "--repeat", str(gifski_repeat),
+                # Frames are already tw x th; gifski caps output at ~800x600
+                # unless given explicit bounds.
+                "-W", str(tw),
+                "-H", str(th),
                 "-o", output_path,
             ]
-            if width_opt != "original":
-                gifski_cmd += ["-W", width_opt]
-            else:
-                # gifski caps output at ~800x600 unless given explicit bounds.
-                gifski_cmd += ["-W", str(tw), "-H", str(th)]
             gifski_cmd += frame_paths
             result = subprocess.run(gifski_cmd, capture_output=True, text=True, timeout=300)
             if result.returncode != 0:
@@ -1475,7 +1484,7 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
 
         # Options
         fps = params["fps"]
-        width_opt = params["width"]
+        height_opt = params["height"]
         start = params["start"]
         end = params["end"]
         encoder = params["encoder"]
@@ -1495,8 +1504,8 @@ def run_conversion(job_id: str, params: dict, release_slot: bool = False):
         output_name = f"{job_id}.gif"
         output_path = str(OUTPUT_DIR / output_name)
 
-        vf_sample = _video_filter(sample_fps, width_opt)
-        vf_playback = _video_filter(sample_fps, width_opt, speed_factor)
+        vf_sample = _video_filter(sample_fps, height_opt)
+        vf_playback = _video_filter(sample_fps, height_opt, speed_factor)
 
         # ffmpeg time-range args
         time_args = []
